@@ -482,7 +482,14 @@ void restore_print_from_eeprom(bool mbl_was_active) {
 
     if (saved_printing_type == PowerPanic::PRINT_TYPE_SD)
     { // M23
-        restore_file_from_sd();
+        if (!restore_file_from_sd()) {
+            // There is nothing to resume. Bail out before the moves below take
+            // the hot nozzle back down to print height and unretract onto the
+            // bed for a print that will never be started.
+            SERIAL_ECHOLNPGM("Power panic: SD file not restored, resume aborted");
+            lcd_setalertstatuspgm(PSTR("RESUME FAILED"));
+            return;
+        }
     }
 
     // Move to the XY print position in logical coordinates, where the print has been killed, but

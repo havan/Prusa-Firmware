@@ -113,7 +113,12 @@ void CardReader::lsDive(const char *prepend, SdFile parent, const char * const m
 					//SERIAL_ECHOPGM(_i("Cannot open subdir"));////MSG_SD_CANT_OPEN_SUBDIR
 					//SERIAL_ECHOLN(lfilename);
 				}
-				lsDive(path, dir, NULL, lsAction, lsParams);
+				// Measured with -fstack-usage: each lsDive frame costs ~156
+				// bytes plus the path VLA, which grows with depth. Skip a call
+				// that the recursionCnt check above would reject on entry
+				// anyway, so the deepest level does not burn a whole frame.
+				if (recursionCnt < MAX_DIR_DEPTH)
+					lsDive(path, dir, NULL, lsAction, lsParams);
 				// close() is done automatically by destructor of SdFile
 
 				if (lsParams.LFN)

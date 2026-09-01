@@ -7125,7 +7125,7 @@ static void menu_action_sdfile(const char* filename)
     eeprom_update_byte_notify((uint8_t*)EEPROM_DIR_DEPTH, depth);
 
     for (uint_least8_t i = 0; i < depth; i++) {
-        eeprom_update_block_notify(card.dir_names[i], (uint8_t*)EEPROM_DIRS + 8 * i, 8);
+        eeprom_update_block_notify(card.dir_names[i], (uint8_t*)EEPROM_DIRS + EEPROM_DIRS_STRIDE * i, EEPROM_DIRS_STRIDE);
     }
 
   if (!check_file(selected_filename)) {
@@ -7408,7 +7408,10 @@ void menu_lcd_lcdupdate_func(void)
 		}
 	}
 #endif//CARDINSERTED
-	if (lcd_next_update_millis < _millis())
+	// Signed difference so the deadline comparison survives the ~49.7 day
+	// _millis() rollover. This also keeps the "update now" idiom used
+	// elsewhere (lcd_next_update_millis = _millis() - 1) working unchanged.
+	if ((int32_t)(_millis() - lcd_next_update_millis) >= 0)
 	{
 		if (lcd_draw_update) {
 			lcd_timeoutToStatus.start();
@@ -7528,7 +7531,12 @@ void lcd_heat_bed_on_load_toggle()
 }
 
 void lcd_reprint_from_eeprom() {
-    restore_file_from_sd();
+    // Do not issue M24 when the stored file could not be restored: it would
+    // otherwise resume whatever file the SD card happens to have selected.
+    if (!restore_file_from_sd()) {
+        lcd_return_to_status();
+        return;
+    }
 
     // M24: Start/resume SD print
     enquecommand_P(MSG_M24);

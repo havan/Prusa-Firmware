@@ -674,7 +674,10 @@ void ProtocolLogic::SwitchFromStartToIdle() {
 }
 
 bool ProtocolLogic::Elapsed(uint32_t timeout) const {
-    return _millis() >= (lastUARTActivityMs + timeout);
+    // Compare elapsed time instead of an absolute deadline: computing
+    // (lastUARTActivityMs + timeout) wraps around the ~49.7 day _millis()
+    // rollover and would then report a spurious timeout immediately.
+    return (_millis() - lastUARTActivityMs) >= timeout;
 }
 
 void ProtocolLogic::RecordUARTActivity() {

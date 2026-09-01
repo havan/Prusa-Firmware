@@ -102,7 +102,10 @@ public:
 #ifdef SDCARD_SORT_ALPHA
   bool presort_flag;
 #endif // SDCARD_SORT_ALPHA
-  char dir_names[MAX_DIR_DEPTH][9];
+  // One DOS 8.3 short name per directory level. chdir() strcpy()s the full
+  // 8.3 name here, which is up to 12 characters plus NUL - a 9 byte row
+  // truncated any name carrying an extension.
+  char dir_names[MAX_DIR_DEPTH][FILENAME_LENGTH];
 private:
   SdFile root,*curDir,workDir,workDirParents[MAX_DIR_DEPTH];
   uint8_t workDirDepth;

@@ -835,9 +835,12 @@ static void temp_runaway_check(uint8_t _heater_id, float _target_temperature, fl
 	float __hysteresis = 0;
 	uint16_t __timeout = 0;
 	bool temp_runaway_check_active = false;
-	static float __preheat_start[2] = { 0,0}; //currently just bed and one extruder
-	static uint8_t __preheat_counter[2] = { 0,0};
-	static uint8_t __preheat_errors[2] = { 0,0};
+	// Indexed by _heater_id: 0 is the bed, 1..EXTRUDERS are the hotends.
+	// Sized to match temp_runaway_status[] etc. so adding an extruder cannot
+	// silently overflow these.
+	static float __preheat_start[1 + EXTRUDERS] = { 0 };
+	static uint8_t __preheat_counter[1 + EXTRUDERS] = { 0 };
+	static uint8_t __preheat_errors[1 + EXTRUDERS] = { 0 };
 
 	if (_millis() - temp_runaway_timer[_heater_id] > 2000)
 	{

@@ -10081,34 +10081,83 @@ void stop_and_save_print_to_ram(float z_move, float e_move)
   }
 }
 
+// The stored directory path must round-trip a full DOS 8.3 name, and the
+// whole stack has to fit the reserved EEPROM region.
+static_assert(EEPROM_DIRS_STRIDE == FILENAME_LENGTH,
+              "EEPROM dir stride must hold a full 8.3 name plus NUL");
+static_assert(MAX_DIR_DEPTH * EEPROM_DIRS_STRIDE <= EEPROM_DIRS_SIZE,
+              "Directory stack overflows the reserved EEPROM_DIRS region");
+
 /// @brief Read saved filename from EEPROM and send g-code command: M23 <filename>
-void restore_file_from_sd()
+/// @returns true if a valid filename was recovered and M23 was enqueued.
+///          false if the stored state is missing or corrupt, in which case
+///          nothing is enqueued and the caller must not start a print.
+bool restore_file_from_sd()
 {
     char filename[FILENAME_LENGTH];
-    char dir_name[9];
-    char extension_ptr[5];
+    char dir_name[FILENAME_LENGTH];
+    bool valid = true;
+
     uint8_t depth = eeprom_read_byte((uint8_t*)EEPROM_DIR_DEPTH);
 
-    for (uint8_t i = 0; i < depth; i++) {
-        eeprom_read_block(dir_name, (const char *)EEPROM_DIRS + 8 * i, 8);
-        dir_name[8] = '\0';
-        card.chdir(dir_name, false);
+    // An erased EEPROM byte reads back as 0xff. Reject any depth the directory
+    // stack cannot hold, otherwise the loop below walks past EEPROM_DIRS.
+    if (depth > MAX_DIR_DEPTH) {
+        valid = false;
+    } else {
+        for (uint8_t i = 0; i < depth && valid; i++) {
+            eeprom_read_block(dir_name, (const char *)EEPROM_DIRS + EEPROM_DIRS_STRIDE * i, EEPROM_DIRS_STRIDE);
+            // Force-terminate: a corrupt EEPROM row need not contain a NUL.
+            dir_name[FILENAME_LENGTH - 1] = '\0';
+            // A failed chdir() must not be ignored: the file name would then be
+            // resolved against the wrong working directory.
+            if ((uint8_t)dir_name[0] == 0xff || !card.chdir(dir_name, false))
+                valid = false;
+        }
     }
 
-    // Recover DOS 8.3 filename without extension.
-    // Short filenames are always null terminated.
-    eeprom_read_block(filename, (const char *)EEPROM_FILENAME, 8);
+    if (valid) {
+        // Recover DOS 8.3 filename without extension.
+        // Short filenames are always null terminated.
+        eeprom_read_block(filename, (const char *)EEPROM_FILENAME, 8);
 
-    // Add null delimiter in case all 8 characters were not NULL
-    filename[8] = '\0';
+        // Add null delimiter in case all 8 characters were not NULL
+        filename[8] = '\0';
 
-    // Add extension to complete the DOS 8.3 filename e.g. ".gco" or ".g"
-    extension_ptr[0] = '.';
-    eeprom_read_block(&extension_ptr[1], (const char *)EEPROM_FILENAME_EXTENSION, 3);
-    extension_ptr[4] = '\0';
-    strcat(filename, extension_ptr);
+        if ((uint8_t)filename[0] == 0xff || filename[0] == '\0')
+            valid = false;
+    }
+
+    if (!valid) {
+        SERIAL_ECHOLNPGM("SD restore: no valid filename stored");
+        return false;
+    }
+
+    // Recover the extension, e.g. ".gco" or ".g". Stop at the first
+    // uninitialised (0xff) byte so an erased field cannot leak into the name.
+    char ext[4];
+    eeprom_read_block(ext, (const char *)EEPROM_FILENAME_EXTENSION, 3);
+    ext[3] = '\0';
+    for (uint8_t i = 0; i < 3; i++) {
+        if ((uint8_t)ext[i] == 0xff) {
+            ext[i] = '\0';
+            break;
+        }
+    }
+
+    // EEPROMs written before EEPROM_FILENAME_EXTENSION existed read back as
+    // 0xff. Fall back to the assumption this code made before that field was
+    // added: SD prints are ".gco".
+    if (ext[0] == '\0')
+        strcpy_P(ext, PSTR("gco"));
+
+    // At most 8 name + '.' + 3 extension + NUL, which is FILENAME_LENGTH.
+    uint8_t len = strlen(filename);
+    filename[len] = '.';
+    strcpy(filename + len + 1, ext);
 
     enquecommandf_P(MSG_M23, filename);
+    return true;
 }
 
 void restore_extruder_temperature_from_ram() {
@@ -10337,7 +10386,9 @@ void M600_wait_for_user() {
 			case 0: //nozzle is hot, waiting for user to press the knob to unload filament
 				delay_keep_alive(4);
 
-				if (_millis() > waiting_start_time + (unsigned long)M600_TIMEOUT * 1000) {
+				// Elapsed-time form: waiting_start_time + timeout would wrap
+				// across the ~49.7 day _millis() rollover and fire immediately.
+				if ((_millis() - waiting_start_time) > (unsigned long)M600_TIMEOUT * 1000) {
 					lcd_display_message_fullscreen_P(_T(MSG_PRESS_TO_PREHEAT));
 					wait_for_user_state = 1;
 					setTargetHotend(0);

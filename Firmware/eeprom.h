@@ -508,7 +508,13 @@ static_assert(sizeof(Sheets) == EEPROM_SHEETS_SIZEOF, "Sizeof(Sheets) is not EEP
 #define EEPROM_BELTSTATUS_Y (EEPROM_BELTSTATUS_X - 2)                           // uint16
 
 #define EEPROM_DIR_DEPTH        (EEPROM_BELTSTATUS_Y-1)
-#define EEPROM_DIRS  (EEPROM_DIR_DEPTH-80) //8 chars for each dir name, max 10 levels
+// Reserved region holding the SD directory path of the last started print.
+// One DOS 8.3 name per level: up to 12 characters plus the NUL terminator,
+// so EEPROM_DIRS_STRIDE must match FILENAME_LENGTH. The region size is
+// unchanged at 80 bytes, so EEPROM_DIRS and every address below it stay put.
+#define EEPROM_DIRS_SIZE 80
+#define EEPROM_DIRS_STRIDE 13
+#define EEPROM_DIRS  (EEPROM_DIR_DEPTH-EEPROM_DIRS_SIZE)
 #define EEPROM_SD_SORT (EEPROM_DIRS - 1) //0 -time, 1-alpha, 2-none
 #define EEPROM_SECOND_SERIAL_ACTIVE (EEPROM_SD_SORT - 1)
 

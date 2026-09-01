@@ -555,7 +555,9 @@ void check_axes_activity()
         // Just starting up fan - run at full power.
         fan_kick_end = _millis() + FAN_KICKSTART_TIME;
         tail_fan_speed = 255;
-      } else if (fan_kick_end > _millis())
+        // Signed difference so the deadline comparison survives the ~49.7 day
+        // _millis() rollover; fan_kick_end is always close to the current time.
+      } else if ((int32_t)(fan_kick_end - _millis()) > 0)
         // Fan still spinning up.
         tail_fan_speed = 255;
     } else {

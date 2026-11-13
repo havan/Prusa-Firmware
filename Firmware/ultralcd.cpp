@@ -5793,6 +5793,14 @@ void lcd_sdcard_menu()
 	static_assert(sizeof(menu_data)>= sizeof(_menu_data_sdcard_t),"_menu_data_sdcard_t doesn't fit into menu_data");
 	_menu_data_sdcard_t* _md = (_menu_data_sdcard_t*)&(menu_data[0]);
 
+	if (!card.mounted)
+	{
+		// Every state below reads the card. Unmounted, each read only runs into the SD
+		// timeouts, long enough for a watchdog reset (seen when the card was pulled).
+		menu_back();
+		return;
+	}
+
 	switch(_md->menuState)
 	{
 		case _uninitialized: //Initialize menu data
@@ -7383,10 +7391,15 @@ void menu_lcd_lcdupdate_func(void)
 				card.mount(false); //delay the sorting to the sd menu. Otherwise, removing the SD card while sorting will not menu_back()
 				card.presort_flag = true; //force sorting of the SD menu
 			}
-			LCD_MESSAGERPGM(MSG_WELCOME);
-			bMain=false;                       // flag (i.e. 'fake parameter') for 'lcd_sdcard_menu()' function
-			menu_submenu(lcd_sdcard_menu, true);
-			lcd_timeoutToStatus.start();
+			if (card.mounted)
+			{
+				LCD_MESSAGERPGM(MSG_WELCOME);
+				bMain=false;                       // flag (i.e. 'fake parameter') for 'lcd_sdcard_menu()' function
+				menu_submenu(lcd_sdcard_menu, true);
+				lcd_timeoutToStatus.start();
+			}
+			else // half-inserted, being pulled, or unreadable: the menu would only read a dead card
+				LCD_MESSAGERPGM(_T(MSG_NO_CARD));
 		}
 		else
 		{

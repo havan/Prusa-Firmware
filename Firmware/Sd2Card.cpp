@@ -20,6 +20,7 @@
 #include "Marlin.h"
 
 #ifdef SDSUPPORT
+#include <avr/wdt.h>
 #include "Sd2Card.h"
 //------------------------------------------------------------------------------
 #ifndef SOFTWARE_SPI
@@ -284,6 +285,10 @@ bool Sd2Card::eraseSingleBlockEnable() {
  * can be determined by calling errorCode() and errorData().
  */
 bool Sd2Card::init(uint8_t sckRateID) {
+  // Init is two waits of up to SD_INIT_TIMEOUT each (CMD0, then ACMD41) and runs from the LCD
+  // loop when a card is inserted: together with the reads that follow, a dead or half-pulled
+  // card would exceed the 4 s watchdog. Feed it before each wait; both waits stay bounded.
+  wdt_reset();
   errorCode_ = type_ = 0;
   // 16-bit init start time allows over a minute
   uint16_t t0 = (uint16_t)_millis();
@@ -321,6 +326,7 @@ bool Sd2Card::init(uint8_t sckRateID) {
     }
   }
   WRITE(MISO, 0); // disable the MISO line pullup
+  wdt_reset();
 
   // send 0xFF until 0xFF received to give card some clock cycles
   t0 = (uint16_t)_millis();
@@ -370,6 +376,7 @@ bool Sd2Card::init(uint8_t sckRateID) {
     for (uint8_t i = 0; i < 3; i++) spiRec();
   }
   chipSelectHigh();
+  wdt_reset(); // the caller usually reads the volume right away
 
 #ifndef SOFTWARE_SPI
   return setSckRate(sckRateID);
@@ -409,6 +416,10 @@ bool Sd2Card::readBlock(uint32_t blockNumber, uint8_t* dst) {
   }
   return true;
  retry:
+   // Each failed attempt can take ~0.9 s of timeouts, three attempts more than the 4 s
+   // watchdog on their own. Feed it only here, on the failure path: a loop of successful
+   // reads (e.g. a corrupt FAT chain) must still trip the watchdog.
+   wdt_reset();
    chipSelectHigh();
    cardCommand(CMD12, 0);//Try sending a stop command, but ignore the result.
    errorCode_ = 0;

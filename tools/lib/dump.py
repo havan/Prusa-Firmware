@@ -15,6 +15,11 @@ class CrashReason(enum.IntEnum):
     STACK_ERROR = 1
     WATCHDOG = 2
     BAD_ISR = 3
+    BAD_PULLUP_TEMP_ISR = 4
+    BAD_PULLUP_STEP_ISR = 5
+    DIAG_STALL = 6
+    DIAG_POSITION = 7
+    DIAG_STACK = 8
 
 class Dump():
     def __init__(self, typ, reason, regs, pc, sp, data, ranges):

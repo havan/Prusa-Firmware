@@ -973,7 +973,19 @@ static void fw_crash_init()
         puts_P(_N("//action:dump_available"));
 
 #ifdef EMERGENCY_DUMP
-        if(crash_reason != dump_crash_reason::manual &&
+        if(crash_reason >= dump_crash_reason::diag_stall &&
+           eeprom_read_byte((uint8_t*)EEPROM_FW_CRASH_FLAG) != 0xFF)
+        {
+            // A diagnostic (non-fatal) dump was taken during the last session.
+            // The printer did not crash, but the user must know the evidence
+            // is there before the next event overwrites it.
+            lcd_show_fullscreen_message_and_wait_P(
+                    _n("DIAG: a problem was "
+                       "detected and a dump "
+                       "was saved. Read it "
+                       "over USB with D21."));
+        }
+        else if(crash_reason != dump_crash_reason::manual &&
            eeprom_read_byte((uint8_t*)EEPROM_FW_CRASH_FLAG) != 0xFF)
         {
             lcd_show_fullscreen_message_and_wait_P(

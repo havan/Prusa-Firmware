@@ -73,12 +73,12 @@ static void __attribute__((noinline)) xfdump_dump_core(dump_header_t& hdr, uint3
 }
 
 
-void xfdump_dump()
+void xfdump_dump(dump_crash_reason reason)
 {
     dump_header_t buf;
     buf.magic = DUMP_MAGIC;
     buf.regs_present = false;
-    buf.crash_reason = (uint8_t)dump_crash_reason::manual;
+    buf.crash_reason = (uint8_t)reason;
 
     // write sram only
     xfdump_dump_core(buf, DUMP_OFFSET + offsetof(dump_t, data.sram),

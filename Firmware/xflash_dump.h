@@ -10,11 +10,16 @@ enum class dump_crash_reason : uint8_t
     bad_isr,
     bad_pullup_temp_isr,
     bad_pullup_step_isr,
+    // Non-fatal dumps taken by the diagnostics in diag.cpp. The printer keeps
+    // running after these, so the dump holds the state at detection time.
+    diag_stall,         // SD print made no progress for too long
+    diag_position,      // planner, stepper and logical positions disagree
+    diag_stack,         // stack high-water mark got too close to .bss
 };
 
 #ifdef XFLASH_DUMP
 void xfdump_reset();    // reset XFLASH dump state
-void xfdump_dump();     // create a new SRAM memory dump
+void xfdump_dump(dump_crash_reason reason = dump_crash_reason::manual); // create a new SRAM memory dump
 
 // return true if a dump is present, save type in "reason" if provided
 bool xfdump_check_state(dump_crash_reason* reason = NULL);

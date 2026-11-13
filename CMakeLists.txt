@@ -211,6 +211,7 @@ set(FW_SOURCES
     Configuration.cpp
     ConfigurationStore.cpp
     Dcodes.cpp
+    diag.cpp
     eeprom.cpp
     fancheck.cpp
     Filament_sensor.cpp

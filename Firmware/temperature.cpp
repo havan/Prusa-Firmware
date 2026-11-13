@@ -29,6 +29,7 @@
  */
 
 #include "temperature.h"
+#include "diag.h"
 #include "stepper.h"
 #include "ultralcd.h"
 #include "menu.h"
@@ -567,6 +568,10 @@ void manage_heater()
 
     // periodically check fans
     checkFans();
+
+    // diagnostics (DIAG_BUILD): stall, position and stack checks. Called from
+    // here because every wait loop keeps calling manage_heater().
+    diag_periodic();
 
 #ifdef THERMAL_MODEL_DEBUG
     thermal_model::log_usr();

@@ -103,6 +103,7 @@
 #endif //XFLASH
 
 #include "xflash_dump.h"
+#include "diag.h"
 
 #ifdef BLINKM
 #include "BlinkM.h"
@@ -1256,6 +1257,8 @@ void setup()
     // of static memory by stack (this needs to be done before soft_pwm_init, since the check is
     // performed inside the soft_pwm_isr)
     SdFatUtil::set_stack_guard();
+    // paint the free RAM above the guard to measure the stack high-water mark
+    diag_init();
 
     // Initialize pwm/temperature loops
     soft_pwm_init();
@@ -1819,6 +1822,7 @@ void loop()
       // this block's SD card length will not be counted twice as its command type has been replaced
       // by CMDBUFFER_CURRENT_TYPE_TO_BE_REMOVED.
       cmdqueue_pop_front();
+      diag_progress();
     }
 	host_keepalive();
   }
@@ -4154,6 +4158,7 @@ void process_commands()
       codenum += _millis();  // keep track of when we started waiting
       previous_millis_cmd.start();
       while(_millis() < codenum) {
+        diag_progress(); // a dwell is a legitimate wait, not a stall
         manage_heater();
         manage_inactivity();
         lcd_update(0);
@@ -5512,6 +5517,7 @@ void process_commands()
 				  codenum = _millis();
 
           }
+          diag_progress(); // waiting for the bed to heat is not a stall
           manage_heater();
           manage_inactivity();
           lcd_update(0);
@@ -8382,6 +8388,17 @@ void process_commands()
     };
 #endif //XFLASH_DUMP
 
+#ifdef DIAG_BUILD
+    /*!
+    ### D90 - Diagnostics status
+    Print the state of the DIAG build checks; see diag.cpp for parameters.
+    */
+    case 90: {
+        dcode_90();
+        break;
+    };
+#endif //DIAG_BUILD
+
 #ifdef EMERGENCY_SERIAL_DUMP
     /*!
     ### D23 - Request emergency dump on serial <a href="https://reprap.org/wiki/G-code#D23:_Request_emergency_dump_on_serial">D23: Request emergency dump on serial</a>
@@ -9268,6 +9285,7 @@ static void wait_for_heater(long codenum, uint8_t extruder) {
 #endif
 				codenum = _millis();
 		}
+		diag_progress(); // waiting for the hotend to heat is not a stall
 		delay_keep_alive(0); //do not disable steppers
 #ifdef TEMP_RESIDENCY_TIME
 			/* start/restart the TEMP_RESIDENCY_TIME timer whenever we reach target temp for the first time

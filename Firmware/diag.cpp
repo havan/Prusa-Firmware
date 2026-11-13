@@ -133,7 +133,15 @@ void check_stall(uint32_t now) {
         printf_P(PSTR("DIAG: stall, no progress for %lus, sdpos %lu, busy_state %d\n"),
                  idle_s, (unsigned long)card.get_sdpos(), (int)busy_state);
         take_dump(dump_crash_reason::diag_stall, F_DUMPED_STALL);
-        lcd_setalertstatuspgm(PSTR("DIAG: stall, dumped"));
+        if (lcd_update_enabled) {
+            lcd_setalertstatuspgm(PSTR("DIAG: stall, dumped"));
+        } else {
+            // A wait loop owns the screen, and what it shows is the best clue
+            // to where the firmware is stuck. lcd_setalertstatuspgm() would
+            // reinitialize the LCD and wipe it, so only queue the text for the
+            // status screen.
+            lcd_setstatuspgm(PSTR("DIAG: stall, dumped"));
+        }
         last_alert_ms = now;
         alert();
     } else if (now - last_alert_ms >= DIAG_REALERT_S * 1000ul) {

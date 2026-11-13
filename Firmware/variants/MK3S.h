@@ -142,6 +142,8 @@
 #define XFLASH_DUMP     // enable dump functionality (including D20/D21/D22)
 #define MENU_DUMP       // enable "Memory dump" in Settings menu
 #define EMERGENCY_DUMP  // trigger crash on stack corruption and WDR
+#define DIAG_BUILD      // runtime diagnostics: stall detector, position and stack checks (diag.cpp)
+#define DIAG_FAULT_INJECT // D90 S/Z fault injection for bench-testing the diagnostics
 
 // Online crash dumper
 //#define EMERGENCY_SERIAL_DUMP   // Request dump via serial on stack corruption and WDR

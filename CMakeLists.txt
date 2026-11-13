@@ -337,8 +337,10 @@ if(CMAKE_CROSSCOMPILING)
   add_link_options(-ffunction-sections -fdata-sections -Wl,--gc-sections)
 
   # LTO (with custom options)
+  # -flto-partition=none: optimize the whole program as one LTO partition, so
+  #   no symbol has to be made global just because it is used from another partition
   add_compile_options(-flto -fno-fat-lto-objects)
-  add_link_options(-flto)
+  add_link_options(-flto -flto-partition=none)
 
   # Call Prologues/Epilogues to reduce code size
   add_compile_options(-mcall-prologues)

@@ -1587,6 +1587,11 @@ void setup()
       printf_P(_N("Power panic detected!\nCurrent bed temp:%d\nSaved bed temp:%d\n"), (int)degBed(), eeprom_read_byte((uint8_t*)EEPROM_UVLO_TARGET_BED));
 #endif //DEBUG_UVLO_AUTOMATIC_RECOVER
       uvlo_auto_recovery_ready = (degBed() > ( (float)eeprom_read_byte((uint8_t*)EEPROM_UVLO_TARGET_BED) - AUTOMATIC_UVLO_BED_TEMP_OFFSET));
+      // Never resume without asking when the saved state is implausible:
+      // the resume would trust a wrong Z and crash the nozzle into the print.
+      const bool saved_z_plausible = uvlo_saved_z_plausible();
+      if (!saved_z_plausible)
+        uvlo_auto_recovery_ready = false;
       if (uvlo_auto_recovery_ready){
 #ifdef DEBUG_UVLO_AUTOMATIC_RECOVER
         puts_P(_N("Automatic recovery!"));
@@ -1596,9 +1601,15 @@ void setup()
 #ifdef DEBUG_UVLO_AUTOMATIC_RECOVER
         puts_P(_N("Normal recovery!"));
 #endif //DEBUG_UVLO_AUTOMATIC_RECOVER
-        if (saved_printing_type == PowerPanic::PRINT_TYPE_HOST) {
+        if (saved_printing_type == PowerPanic::PRINT_TYPE_HOST && saved_z_plausible) {
           recover_print(0);
         } else {
+          if (!saved_z_plausible) {
+            lcd_show_fullscreen_message_and_wait_P(
+                _n("Saved Z position does not match the print. "
+                   "Resuming may crash the nozzle. Check first!"));
+          }
+          // The default selection of this prompt is "No".
           const uint8_t btn = lcd_show_multiscreen_message_yes_no_and_wait_P(_T(MSG_RECOVER_PRINT), false);
           if ( btn == LCD_LEFT_BUTTON_CHOICE) {
             recover_print(0);

@@ -324,6 +324,25 @@ ISR(INT4_vect) {
     }
 }
 
+// Largest accepted difference between the saved Z and the Z at the start of
+// the G-code segment that was executing. The two differ legitimately by the
+// mesh bed leveling offset (saved Z is without MBL) and by a Z move inside
+// that segment (Z hop, layer change), both well below this.
+static constexpr float UVLO_Z_PLAUSIBLE_TOLERANCE = 5.0f;
+
+bool uvlo_saved_z_plausible() {
+    const float start_x = eeprom_read_float((float*)(EEPROM_UVLO_SAVED_START_POSITION + 0));
+    if (start_x == SAVED_START_POSITION_UNSET)
+        return true; // no segment was executing, nothing to compare with
+    const float start_z = eeprom_read_float((float*)(EEPROM_UVLO_SAVED_START_POSITION + 2 * sizeof(float)));
+    const float z = eeprom_read_float((float*)EEPROM_UVLO_CURRENT_POSITION_Z);
+    if (fabs(z - start_z) <= UVLO_Z_PLAUSIBLE_TOLERANCE)
+        return true;
+    printf_P(PSTR("Power panic: saved Z %.3f does not match segment start Z %.3f\n"),
+             (double)z, (double)start_z);
+    return false;
+}
+
 void recover_print(uint8_t automatic) {
     lcd_setstatuspgm(_T(MSG_RECOVERING_PRINT));
 

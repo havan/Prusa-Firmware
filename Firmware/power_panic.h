@@ -17,4 +17,11 @@ enum PrintType : uint8_t {
 
 void uvlo_();
 void recover_print(uint8_t automatic);
+
+/// Sanity-check the print state saved in EEPROM before resuming it.
+/// The resume cannot home Z: it trusts the saved Z and moves down to the
+/// print from there. If that Z is wrong the nozzle is driven into the print
+/// or the bed. Returns false when the saved Z disagrees with the Z of the
+/// G-code segment that was being executed.
+bool uvlo_saved_z_plausible();
 void setup_uvlo_interrupt();

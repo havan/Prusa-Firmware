@@ -87,6 +87,56 @@ static DiagCrumbs crumbs __attribute__((section(".noinit")));
 // and setup() configure anything. Order: ADCSRA, TIMSK0..TIMSK5.
 static uint8_t boot_regs[7] __attribute__((section(".noinit")));
 
+// CPU state at the reset vector, saved by diag_sample_entry() before the C
+// runtime resets SP. After a software restart this is the state of the code
+// that jumped to 0: Z = 0 points at an icall/eicall through a null pointer,
+// and the bytes above SP hold the return addresses of the call chain.
+static constexpr uint8_t DIAG_ENTRY_STACK = 128;
+extern "C" {
+uint8_t diag_entry_regs[32] __attribute__((section(".noinit"), used));
+uint8_t diag_entry_io[5] __attribute__((section(".noinit"), used)); // SREG SPL SPH EIND RAMPZ
+uint8_t diag_entry_stack[DIAG_ENTRY_STACK] __attribute__((section(".noinit"), used));
+}
+
+// Runs in .init1, before .init2 clears r1/SREG and loads SP, so it must not
+// touch any register before saving it: pure asm.
+extern "C" void diag_sample_entry() __attribute__((naked, used, section(".init1")));
+extern "C" void diag_sample_entry() {
+    asm volatile(
+        ".irp r,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31\n\t"
+        "sts diag_entry_regs+\\r, r\\r\n\t"
+        ".endr\n\t"
+        "in r0, __SREG__\n\t"
+        "sts diag_entry_io+0, r0\n\t"
+        "in r30, __SP_L__\n\t"
+        "in r31, __SP_H__\n\t"
+        "sts diag_entry_io+1, r30\n\t"
+        "sts diag_entry_io+2, r31\n\t"
+        "in r0, 0x3c\n\t" // EIND
+        "sts diag_entry_io+3, r0\n\t"
+        "in r0, 0x3b\n\t" // RAMPZ
+        "sts diag_entry_io+4, r0\n\t"
+        // Copy DIAG_ENTRY_STACK bytes from SP+1 (the last byte pushed), clamped
+        // so the copy ends at RAMEND.
+        "adiw r30, 1\n\t"
+        "ldi r24, lo8(%[last])\n\t"
+        "ldi r25, hi8(%[last])\n\t"
+        "cp r24, r30\n\t"
+        "cpc r25, r31\n\t"
+        "brsh 1f\n\t"
+        "movw r30, r24\n\t"
+        "1:\n\t"
+        "ldi r26, lo8(diag_entry_stack)\n\t"
+        "ldi r27, hi8(diag_entry_stack)\n\t"
+        "ldi r24, %[n]\n\t"
+        "2:\n\t"
+        "ld r0, Z+\n\t"
+        "st X+, r0\n\t"
+        "dec r24\n\t"
+        "brne 2b\n\t"
+        :: [last] "i"(RAMEND + 1 - DIAG_ENTRY_STACK), [n] "i"(DIAG_ENTRY_STACK));
+}
+
 // Runs in .init3: after __init has set up SP and r1 = 0, before .data and
 // .bss are initialised. A naked function placed in an .initN section has no
 // prologue, epilogue or ret; execution falls through to the next section.
@@ -311,6 +361,30 @@ void diag_boot_report() {
                             : PSTR("cold: power-on, brown-out, reset pin or watchdog"),
              boot_regs[0], boot_regs[1], boot_regs[2], boot_regs[3], boot_regs[4],
              boot_regs[5], boot_regs[6]);
+    {
+        const uint8_t *r = diag_entry_regs;
+        const uint16_t sp = diag_entry_io[1] | (diag_entry_io[2] << 8);
+        printf_P(PSTR("DIAG: entry SP %04x SREG %02x EIND %02x RAMPZ %02x X %02x%02x Y %02x%02x Z %02x%02x\n"),
+                 sp, diag_entry_io[0], diag_entry_io[3], diag_entry_io[4],
+                 r[27], r[26], r[29], r[28], r[31], r[30]);
+        if (warm_restart()) {
+            // Everything needed to unwind the stack with the ELF: all registers,
+            // and the stack bytes from the first one copied (SP+1, clamped).
+            printf_P(PSTR("DIAG: entry regs r0..r31 "));
+            for (uint8_t i = 0; i < 32; ++i)
+                printf_P(PSTR("%02x"), r[i]);
+            putchar('\n');
+            const uint16_t first = (sp + 1u <= RAMEND + 1u - DIAG_ENTRY_STACK) ? sp + 1u
+                                                                              : RAMEND + 1u - DIAG_ENTRY_STACK;
+            for (uint8_t i = 0; i < DIAG_ENTRY_STACK; ++i) {
+                if (i % 32 == 0)
+                    printf_P(PSTR("DIAG: entry stack %04x:"), first + i);
+                printf_P(PSTR(" %02x"), diag_entry_stack[i]);
+                if (i % 32 == 31)
+                    putchar('\n');
+            }
+        }
+    }
     if (crumbs.magic == DIAG_CRUMB_MAGIC && crumbs.next < DIAG_CRUMB_CMDS) {
         ++crumbs.sessions;
         printf_P(PSTR("DIAG: previous session: up %lums, reset #%u since RAM was lost; "

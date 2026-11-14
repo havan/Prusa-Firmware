@@ -1853,6 +1853,7 @@ void adc_callback()
 #endif //AMBIENT_THERMISTOR
 #ifdef VOLT_PWR_PIN
     current_voltage_raw_pwr = adc_values[ADC_PIN_IDX(VOLT_PWR_PIN)];
+    diag_voltage_sample(current_voltage_raw_pwr);
 #endif
 #ifdef VOLT_BED_PIN
     current_voltage_raw_bed = adc_values[ADC_PIN_IDX(VOLT_BED_PIN)]; // 6->9

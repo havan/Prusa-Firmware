@@ -268,7 +268,14 @@ void invert_z_endstop(bool endstop_invert)
 
 // "The Stepper Driver Interrupt" - This timer interrupt is the workhorse.
 // It pops blocks from the block_buffer and executes them by pulsing the stepper pins appropriately.
+#ifdef DIAG_BUILD
+static uint16_t diag_isr_count; // read with interrupts off in st_diag_snapshot()
+#endif
+
 ISR(TIMER1_COMPA_vect) {
+#ifdef DIAG_BUILD
+  ++diag_isr_count;
+#endif
 #ifdef DEBUG_STACK_MONITOR
 	uint16_t sp = SPL + 256 * SPH;
 	if (sp < SP_min) SP_min = sp;
@@ -1323,6 +1330,30 @@ void st_set_e_position(const long &e)
   count_position[E_AXIS] = e;
   CRITICAL_SECTION_END;
 }
+
+#ifdef DIAG_BUILD
+void st_diag_snapshot(StDiagSnapshot &s)
+{
+  CRITICAL_SECTION_START;
+  s.isr_count = diag_isr_count;
+  s.block = current_block;
+  s.steps_done = step_events_completed.wide;
+  s.acc_step_rate = acc_step_rate;
+  s.step_loops = step_loops;
+  s.timsk1 = TIMSK1;
+  s.ocr1a = OCR1A;
+  s.tcnt1 = TCNT1;
+#ifdef LIN_ADVANCE
+  s.next_main_isr = nextMainISR;
+  s.next_adv_isr = nextAdvanceISR;
+  s.adv_steps = current_adv_steps;
+  s.adv_target = target_adv_steps;
+  s.e_steps = e_steps;
+  s.la_phase = LA_phase;
+#endif
+  CRITICAL_SECTION_END;
+}
+#endif //DIAG_BUILD
 
 long st_get_position(uint8_t axis)
 {

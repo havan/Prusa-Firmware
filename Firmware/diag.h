@@ -40,6 +40,17 @@ void diag_command();
 //! plus the last commands it ran. Call once, after the boot banner.
 void diag_boot_report();
 
+//! Lowest and highest raw 24 V supply reading (VOLT_PWR_PIN, oversampled) since boot.
+extern uint16_t diag_vpwr_min, diag_vpwr_max;
+
+//! Track the supply voltage range. Called from the ADC interrupt with each new reading.
+inline void diag_voltage_sample(uint16_t raw) {
+    if (raw < diag_vpwr_min)
+        diag_vpwr_min = raw;
+    if (raw > diag_vpwr_max)
+        diag_vpwr_max = raw;
+}
+
 #else
 
 inline void diag_init() {}
@@ -47,5 +58,6 @@ inline void diag_progress() {}
 inline void diag_periodic() {}
 inline void diag_command() {}
 inline void diag_boot_report() {}
+inline void diag_voltage_sample(uint16_t) {}
 
 #endif // DIAG_BUILD

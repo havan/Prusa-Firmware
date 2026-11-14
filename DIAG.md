@@ -30,6 +30,8 @@ The power-panic resume then trusted that Z and drove the nozzle into the print.
 | 3 | **Stack high-water mark** | Less than 128 bytes of free stack are left above the static variables | Memory dump, serial report, beeps |
 | 4 | **Safer power-panic resume** | The saved Z differs by more than 5 mm from the Z of the G-code segment that was running | No automatic resume: a warning, then the usual prompt (default **No**) |
 | 5 | **Reset forensics** | Every boot | One line saying whether the last reset was a **software restart** (a jump to address 0: the peripherals were still configured) or a **hardware reset** (power-on, brown-out, reset pin, watchdog). Then the last 4 commands before the reset, with their SD file positions, unless the power was off. |
+| 6 | **Motion stall report** | During a print, the move at the head of the planner queue doesn't finish for 3 s plus its own nominal duration (the head stops dead while the firmware keeps running) | Serial report: the planner queue and block, the stepper interrupt state (enabled? running?), the waiting command, temperatures. A second line when motion resumes. No dump, the print continues. |
+| 7 | **Hardware sanity** | Every boot; continuously for the supply | A march C- RAM test of everything outside `.noinit` (~60 ms), a CRC-16 of the program flash (~0.4 s, compare it with the hex), and the lowest/highest 24 V supply reading (`D90`). A failing part shows up here, not as a firmware fault. |
 
 - The checks run from `manage_heater()`, so they still run while the main loop is trapped
   in a wait loop.
@@ -39,7 +41,7 @@ The power-panic resume then trusted that Z and drove the nozzle into the print.
   was saved"*. Read the dump out before the next event overwrites it.
 
 Code: `Firmware/diag.cpp`, `Firmware/diag.h`, and small hooks in `Marlin_main.cpp`,
-`temperature.cpp`, `power_panic.cpp` and `xflash_dump.*`. The version stays 3.14.1
+`temperature.cpp`, `stepper.cpp`, `power_panic.cpp` and `xflash_dump.*`. The version stays 3.14.1
 (PrusaSlicer G-code checks keep working). The commit hash in the boot log and M115 tells
 this build apart. The EEPROM layout is unchanged, so calibration and settings survive
 flashing in both directions.
@@ -51,11 +53,12 @@ printer**, so connect *before* starting a print you want to talk to.
 
 | Command | Effect |
 |---|---|
-| `D90` | Print state: stall timer, stack minimum, largest position error seen, dumps taken |
+| `D90` | Print state: stall timer, stack minimum, largest position error seen, dumps taken, motion stalls, 24 V range, boot RAM test |
 | `D90 T<s>` | Set the stall timeout to `<s>` seconds (`T0` = default 300 s). Not saved. |
 | `D90 S` | *Fault injection.* Trap the firmware in a watchdog-feeding wait loop, like the original hang, until the knob is pressed. Arms the stall detector even without a print. |
 | `D90 Z<steps>` | *Fault injection.* Offset the Z stepper counter by `<steps>` (400 steps = 1 mm). During a print, the position check must dump and stop the print. |
 | `D90 J` | *Fault injection.* Jump to address 0, like a corrupted return address. The printer restarts; the boot log must say `reset WARM` and list `D90 J` as the last command. |
+| `D90 M<ms>` | *Fault injection.* Switch the stepper interrupt off for `<ms>` ms. Queue a long move first: the motion stall report must fire (TIMSK1 without bit 1, 0 isr/s) and the resume line must follow. |
 
 ## Testing it on the printer
 

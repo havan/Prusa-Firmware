@@ -90,4 +90,24 @@ void microstep_readings();
   void babystep(const uint8_t axis,const bool direction); // perform a short step with a single stepper motor, outside of any convention
 #endif
 
+#ifdef DIAG_BUILD
+//! Stepper interrupt state for the motion stall report (diag.cpp).
+struct StDiagSnapshot {
+  uint16_t isr_count;    // stepper ISR entries, wraps
+  const block_t *block;  // block being traced, NULL if none
+  uint32_t steps_done;   // step_events_completed of that block
+  uint16_t acc_step_rate;
+  uint8_t step_loops;
+  uint8_t timsk1;
+  uint16_t ocr1a, tcnt1;
+#ifdef LIN_ADVANCE
+  uint16_t next_main_isr, next_adv_isr;
+  uint16_t adv_steps, adv_target;
+  int8_t e_steps, la_phase;
+#endif
+};
+//! Take a consistent copy of the stepper interrupt state.
+void st_diag_snapshot(StDiagSnapshot &s);
+#endif //DIAG_BUILD
+
 #endif

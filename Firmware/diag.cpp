@@ -26,6 +26,14 @@
 //!     sampled before the C runtime starts, and the last commands are kept in
 //!     .noinit RAM, so the next boot can tell the two apart and show what ran
 //!     just before.
+//!  5. A motion stall report: the head stopped dead for several seconds in the
+//!     middle of a print and then carried on, with the main loop alive. When
+//!     the block at the planner tail doesn't change for DIAG_MOTION_STALL_MS,
+//!     the planner and stepper interrupt state is printed once, and again
+//!     when motion resumes.
+//!  6. Hardware sanity: a march test of the RAM at every boot (outside .noinit),
+//!     a CRC of the program flash at boot, and the 24 V supply range. They tell
+//!     a failing part apart from a firmware fault.
 //!
 //! All checks are rate limited and run from manage_heater(), which every wait
 //! loop calls; see diag.h.
@@ -36,7 +44,9 @@
 
 #include <avr/io.h>
 #include <avr/pgmspace.h>
+#include <avr/wdt.h>
 #include <string.h>
+#include <util/crc16.h>
 #include "Marlin.h"
 #include "cardreader.h"
 #include "cmdqueue.h"
@@ -47,6 +57,7 @@
 #include "planner.h"
 #include "sound.h"
 #include "stepper.h"
+#include "temperature.h"
 #include "ultralcd.h"
 #include "xflash_dump.h"
 
@@ -58,6 +69,7 @@ static constexpr float DIAG_POS_TOLERANCE_MM = 2.0f;     // allowed disagreement
 static constexpr uint16_t DIAG_STACK_MIN_FREE = 128;     // bytes; below this = dump
 static constexpr uint8_t DIAG_STACK_PAINT = 0xC5;
 static constexpr uint16_t DIAG_REALERT_S = 60;           // beep period while stalled
+static constexpr uint16_t DIAG_MOTION_STALL_MS = 3000;   // same planner block this long = report
 
 // Planner/stepper state that has no public declaration.
 extern float position_float[NUM_AXIS];
@@ -151,6 +163,77 @@ extern "C" void diag_sample_boot_regs() {
     boot_regs[6] = TIMSK5;
 }
 
+// Result of the boot RAM test. In .noinit, which the test skips.
+struct DiagRamTest {
+    uint16_t errors;  // failing reads, saturating
+    uint16_t addr;    // first failing address
+    uint8_t expected; // and what it held instead
+    uint8_t got;
+};
+static DiagRamTest ram_test __attribute__((section(".noinit")));
+extern "C" char __noinit_start, __noinit_end;
+
+static inline __attribute__((always_inline)) void ram_check(volatile uint8_t *p, uint8_t expected) {
+    const uint8_t got = *p;
+    if (got != expected) {
+        if (ram_test.errors == 0) {
+            ram_test.addr = (uint16_t)p;
+            ram_test.expected = expected;
+            ram_test.got = got;
+        }
+        if (ram_test.errors != UINT16_MAX)
+            ++ram_test.errors;
+    }
+}
+
+// March C- over [lo, hi) with background pattern bg and its inverse. Finds
+// stuck, transition and most coupling faults, not transient flips.
+static inline __attribute__((always_inline)) void ram_march(volatile uint8_t *lo, volatile uint8_t *hi, uint8_t bg) {
+    const uint8_t inv = ~bg;
+    volatile uint8_t *p;
+    wdt_reset();
+    for (p = lo; p < hi; ++p) // up: w0
+        *p = bg;
+    wdt_reset();
+    for (p = lo; p < hi; ++p) { // up: r0 w1
+        ram_check(p, bg);
+        *p = inv;
+    }
+    wdt_reset();
+    for (p = lo; p < hi; ++p) { // up: r1 w0
+        ram_check(p, inv);
+        *p = bg;
+    }
+    wdt_reset();
+    for (p = hi; p-- != lo;) { // down: r0 w1
+        ram_check(p, bg);
+        *p = inv;
+    }
+    wdt_reset();
+    for (p = hi; p-- != lo;) { // down: r1 w0
+        ram_check(p, inv);
+        *p = bg;
+    }
+    wdt_reset();
+    for (p = lo; p < hi; ++p) // r0
+        ram_check(p, bg);
+}
+
+// Runs in .init3 like diag_sample_boot_regs(): SP is at RAMEND with nothing
+// pushed, and .data/.bss are not set up yet, so every byte outside .noinit is
+// free to overwrite. Must not call anything (a call would push onto the RAM
+// under test) and must not spill to the stack; check the disassembly after
+// changing it. Takes about 60 ms.
+extern "C" void diag_ram_test() __attribute__((naked, used, section(".init3")));
+extern "C" void diag_ram_test() {
+    ram_test.errors = 0;
+    for (uint8_t pass = 0; pass < 4; ++pass) {
+        volatile uint8_t *lo = (pass & 1) ? (volatile uint8_t *)&__noinit_end : (volatile uint8_t *)RAMSTART;
+        volatile uint8_t *hi = (pass & 1) ? (volatile uint8_t *)(RAMEND + 1) : (volatile uint8_t *)&__noinit_start;
+        ram_march(lo, hi, (pass & 2) ? 0x55 : 0x00);
+    }
+}
+
 // The firmware keeps the ADC running for the temperature readings from boot
 // on. Neither the hardware reset nor the bootloader enables it, so ADEN set at
 // the reset vector means the previous session jumped there in software.
@@ -177,6 +260,17 @@ uint32_t last_alert_ms;
 uint16_t stack_min_free = UINT16_MAX;
 float max_step_err_mm;  // worst |stepper - planner| seen, for validating the tolerance
 float max_logic_err_mm; // worst |planner - world2machine(current_position)| seen
+
+// Motion stall tracking (check_motion).
+constexpr uint8_t NO_TAIL = 0xFF;
+uint8_t motion_tail = NO_TAIL; // planner tail index being watched
+bool motion_reported;          // the current stall was reported
+uint32_t motion_since_ms;      // when that tail was first seen
+uint32_t motion_steps_start;   // steps done in the block when the stall was reported
+uint32_t motion_steps_last;    // steps done at the last check
+uint16_t isr_count_prev;
+uint8_t motion_stalls;         // reported this boot
+uint32_t motion_stall_max_ms;  // longest reported
 
 uint8_t *stack_paint_start() {
     // Leave the stock stack guard word (STACK_GUARD_MARGIN, 4 bytes) alone.
@@ -307,7 +401,84 @@ void check_stack() {
     }
 }
 
+void motion_stall_end(uint32_t now) {
+    if (!motion_reported)
+        return;
+    motion_reported = false;
+    const uint32_t ms = now - motion_since_ms;
+    if (ms > motion_stall_max_ms)
+        motion_stall_max_ms = ms;
+    printf_P(PSTR("DIAG: motion resumed after ~%lums; the stalled block advanced %lu steps after the report\n"),
+             ms, motion_steps_last - motion_steps_start);
+}
+
+//! Report a planner tail block that stays in place for DIAG_MOTION_STALL_MS
+//! during a print. A G-code waiting for a planner slot keeps calling
+//! manage_heater(), so this runs while the motion is stuck.
+void check_motion(uint32_t now) {
+    StDiagSnapshot s;
+    st_diag_snapshot(s);
+    const uint16_t isr_per_period = s.isr_count - isr_count_prev;
+    isr_count_prev = s.isr_count;
+
+    const bool armed = (flags & F_FORCE_ARMED)
+        || (printJobOngoing() && !printingIsPaused() && !saved_printing && !homing_flag
+            && !mesh_bed_leveling_flag);
+    const uint8_t tail = block_buffer_tail;
+    if (!armed || !blocks_queued() || tail != motion_tail) {
+        motion_stall_end(now);
+        motion_tail = (armed && blocks_queued()) ? tail : NO_TAIL;
+        motion_since_ms = now;
+        return;
+    }
+    motion_steps_last = s.steps_done;
+    if (motion_reported)
+        return;
+    // A long slow block (the purge line, a slow Z move) is not a stall: allow
+    // its nominal duration plus 2 s. A garbage speed counts as zero duration.
+    const block_t *b = s.block ? s.block : &block_buffer[tail];
+    float expect_ms = (b->nominal_speed > 0.1f) ? 1000.0f * b->millimeters / b->nominal_speed : 0.0f;
+    if (!(expect_ms < 60000.0f)) // also catches NaN
+        expect_ms = 0.0f;
+    const uint32_t stalled_ms = now - motion_since_ms;
+    if (stalled_ms < DIAG_MOTION_STALL_MS || stalled_ms < (uint32_t)expect_ms + 2000u)
+        return;
+
+    motion_reported = true;
+    motion_steps_start = s.steps_done;
+    if (motion_stalls != UINT8_MAX)
+        ++motion_stalls;
+    printf_P(PSTR("DIAG: motion stall %lums: queued %u (tail %u head %u), %S block: %lu/%lu steps, "
+                  "%.2fmm at %.1fmm/s (~%lums), rate %lu/%lu/%lu, accel until %lu, decel after %lu, flag %02x busy %u\n"),
+             stalled_ms, moves_planned(), tail, block_buffer_head,
+             s.block ? PSTR("current") : PSTR("no current, tail"),
+             s.block ? s.steps_done : 0ul, (unsigned long)b->step_event_count.wide,
+             (double)b->millimeters, (double)b->nominal_speed, (uint32_t)expect_ms, (unsigned long)b->initial_rate,
+             (unsigned long)b->nominal_rate, (unsigned long)b->final_rate,
+             (unsigned long)b->accelerate_until, (unsigned long)b->decelerate_after, b->flag, b->busy);
+    printf_P(PSTR("DIAG:   stepper isr %u/s, TIMSK1 %02x OCR1A %u TCNT1 %u, acc_step_rate %u loops %u"),
+             isr_per_period, s.timsk1, s.ocr1a, s.tcnt1, s.acc_step_rate, s.step_loops);
+#ifdef LIN_ADVANCE
+    printf_P(PSTR(", LA main %u adv %u steps %u->%u e %d phase %d"), s.next_main_isr,
+             s.next_adv_isr, s.adv_steps, s.adv_target, s.e_steps, s.la_phase);
+#endif
+    char text[DIAG_CRUMB_CMD_LEN + 1];
+    strncpy(text, CMDBUFFER_CURRENT_STRING, DIAG_CRUMB_CMD_LEN);
+    text[DIAG_CRUMB_CMD_LEN] = 0;
+    printf_P(PSTR("\nDIAG:   waiting command: sdpos %lu '%s', T %.1f/%d B %.1f/%d\n"),
+             (unsigned long)card.get_sdpos(), text, (double)degHotend(0), degTargetHotend(0),
+             (double)degBed(), degTargetBed());
+}
+
+float raw_to_volts(uint16_t raw) {
+    // Same conversion as the LCD Voltages screen (ultralcd.cpp).
+    return 5.0f * raw / (1023.0f * OVERSAMPLENR) / (2370.0f / (2370.0f + 10000.0f));
+}
+
 } // anonymous namespace
+
+uint16_t diag_vpwr_min = UINT16_MAX;
+uint16_t diag_vpwr_max;
 
 void diag_init() {
     // Interrupts must be off: an ISR firing now would push its frame below SP,
@@ -337,6 +508,7 @@ void diag_periodic() {
     flags |= F_IN_PERIODIC;
 
     check_stall(now);
+    check_motion(now);
     check_position();
     if (++period_count >= DIAG_STACK_PERIOD) {
         period_count = 0;
@@ -385,6 +557,27 @@ void diag_boot_report() {
             }
         }
     }
+    if (ram_test.errors == 0) {
+        printf_P(PSTR("DIAG: RAM test passed (march C-, %u bytes outside .noinit)\n"),
+                 (unsigned)(RAMEND + 1 - RAMSTART - (&__noinit_end - &__noinit_start)));
+    } else {
+        printf_P(PSTR("DIAG: RAM TEST FAILED: %u bad reads, first at %04x: expected %02x, read %02x\n"),
+                 ram_test.errors, ram_test.addr, ram_test.expected, ram_test.got);
+    }
+    {
+        // CRC-16/CCITT (avr-libc _crc_ccitt_update, init FFFF) of the program
+        // image as flashed: .text plus the .data initializers. Compare with the
+        // hex on the PC. About 0.4 s.
+        extern char __data_load_end;
+        const uint32_t end = pgm_get_far_address(__data_load_end);
+        uint16_t crc = 0xFFFF;
+        for (uint32_t a = 0; a < end; ++a) {
+            if ((a & 0xFFF) == 0)
+                wdt_reset();
+            crc = _crc_ccitt_update(crc, pgm_read_byte_far(a));
+        }
+        printf_P(PSTR("DIAG: flash crc16 %04x over %lu bytes\n"), crc, end);
+    }
     if (crumbs.magic == DIAG_CRUMB_MAGIC && crumbs.next < DIAG_CRUMB_CMDS) {
         ++crumbs.sessions;
         printf_P(PSTR("DIAG: previous session: up %lums, reset #%u since RAM was lost; "
@@ -416,7 +609,7 @@ void diag_boot_report() {
 Print the state of the DIAG build checks.
 #### Usage
 
-    D90 [ T | S | Z | J ]
+    D90 [ T | S | Z | J | M ]
 
 #### Parameters
 - `T` - Set the stall timeout in seconds (0 restores the default). Not saved.
@@ -428,6 +621,9 @@ Print the state of the DIAG build checks.
 - `J` - (fault injection) Jump to address 0, like a corrupted return address
         would. The next boot must report a WARM reset and list this D90 as the
         last command.
+- `M` - (fault injection) Switch the stepper interrupt off for this many ms.
+        Queue a long move first: the motion stall report must fire, name
+        TIMSK1 without OCIE1A (bit 1) and 0 isr/s, then report the resume.
 */
 void dcode_90() {
     if (code_seen('T')) {
@@ -446,6 +642,22 @@ void dcode_90() {
         puts_P(PSTR("DIAG: jumping to address 0"));
         ((void (*)())0)();
     }
+    if (code_seen('M')) {
+        const uint16_t ms = code_value_short();
+        printf_P(PSTR("DIAG: stepper interrupt off for %ums\n"), ms);
+        flags |= F_FORCE_ARMED;
+        DISABLE_STEPPER_DRIVER_INTERRUPT();
+        const uint32_t t0 = _millis();
+        while (_millis() - t0 < ms)
+            delay_keep_alive(50);
+        ENABLE_STEPPER_DRIVER_INTERRUPT();
+        // Stay armed until the stalled block finishes, so the resume is reported.
+        const uint8_t tail = block_buffer_tail;
+        while (blocks_queued() && block_buffer_tail == tail)
+            delay_keep_alive(50);
+        delay_keep_alive(DIAG_PERIOD_MS + 100);
+        flags &= ~F_FORCE_ARMED;
+    }
     if (code_seen('S')) {
         puts_P(PSTR("DIAG: stall trap, press the knob to leave"));
         flags |= F_FORCE_ARMED;
@@ -462,6 +674,16 @@ void dcode_90() {
     }
 #endif // DIAG_FAULT_INJECT
     const uint32_t now = _millis();
+    uint16_t vmin, vmax;
+    CRITICAL_SECTION_START;
+    vmin = diag_vpwr_min;
+    vmax = diag_vpwr_max;
+    CRITICAL_SECTION_END;
+    printf_P(PSTR("DIAG: motion stalls %u, longest ~%lums\n"
+                  "DIAG: 24V supply since boot min %.2fV max %.2fV\n"
+                  "DIAG: boot RAM test %S\n"),
+             motion_stalls, motion_stall_max_ms, (double)raw_to_volts(vmin), (double)raw_to_volts(vmax),
+             ram_test.errors ? PSTR("FAILED") : PSTR("passed"));
     printf_P(PSTR("DIAG: build " FW_VERSION_FULL "_" FW_COMMIT_HASH "\n"
                   "DIAG: stall armed %d, idle %lus, timeout %us\n"
                   "DIAG: stack min free %u bytes (now %u)\n"

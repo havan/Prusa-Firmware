@@ -26,9 +26,10 @@ The power-panic resume then trusted that Z and drove the nozzle into the print.
 | | What | When it fires | What happens |
 |---|---|---|---|
 | 1 | **Stall detector** | An SD print makes no progress for 5 minutes. Heating, moves, dwells, homing, mesh leveling and waiting for the user count as progress. | Memory dump, serial report, LCD status, three beeps, repeated every minute |
-| 2 | **Position check** | With no moves queued, the stepper counters, the planner target and the logical position disagree by more than 2 mm on X, Y or Z. They should match exactly. | Memory dump, then the print is **stopped** (the next move could crash the nozzle) |
+| 2 | **Position check** | With no moves queued, the stepper counters, the planner target and the logical position (after the XYZ-calibration transform) disagree by more than 2 mm on X, Y or Z. They should match exactly. | Memory dump, then the print is **stopped** (the next move could crash the nozzle) |
 | 3 | **Stack high-water mark** | Less than 128 bytes of free stack are left above the static variables | Memory dump, serial report, beeps |
 | 4 | **Safer power-panic resume** | The saved Z differs by more than 5 mm from the Z of the G-code segment that was running | No automatic resume: a warning, then the usual prompt (default **No**) |
+| 5 | **Reset forensics** | Every boot | One line saying whether the last reset was a **software restart** (a jump to address 0: the peripherals were still configured) or a **hardware reset** (power-on, brown-out, reset pin, watchdog). Then the last 4 commands before the reset, with their SD file positions, unless the power was off. |
 
 - The checks run from `manage_heater()`, so they still run while the main loop is trapped
   in a wait loop.
@@ -54,6 +55,7 @@ printer**, so connect *before* starting a print you want to talk to.
 | `D90 T<s>` | Set the stall timeout to `<s>` seconds (`T0` = default 300 s). Not saved. |
 | `D90 S` | *Fault injection.* Trap the firmware in a watchdog-feeding wait loop, like the original hang, until the knob is pressed. Arms the stall detector even without a print. |
 | `D90 Z<steps>` | *Fault injection.* Offset the Z stepper counter by `<steps>` (400 steps = 1 mm). During a print, the position check must dump and stop the print. |
+| `D90 J` | *Fault injection.* Jump to address 0, like a corrupted return address. The printer restarts; the boot log must say `reset WARM` and list `D90 J` as the last command. |
 
 ## Testing it on the printer
 
@@ -69,7 +71,11 @@ printer**, so connect *before* starting a print you want to talk to.
    - It should report `DIAG: position mismatch axis Z`, save a dump (reason 7) and stop
      with *"DIAG: position corrupted"*.
    - The injected offset only changes the counter, not the motion, so nothing crashes.
-4. **Normal prints:** after a few real prints, send `D90`. *max position error* should stay
+4. **Reset forensics:** send `D90 J`. The printer restarts and the boot log must show
+   `DIAG: reset WARM` with `D90 J` as the last command. Then close and reopen the serial
+   port (this resets through the reset pin): the boot must show `reset cold` and still
+   list the last commands.
+5. **Normal prints:** after a few real prints, send `D90`. *max position error* should stay
    tiny (≤ 0.05 mm), well under the 2 mm threshold. *stack min free* shows the real stack
    headroom.
 

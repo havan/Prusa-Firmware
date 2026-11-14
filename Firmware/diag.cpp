@@ -52,7 +52,7 @@ static constexpr uint16_t DIAG_REALERT_S = 60;           // beep period while st
 
 // Planner/stepper state that has no public declaration.
 extern float position_float[NUM_AXIS];
-extern char __bss_end;
+extern char __heap_start; // end of .data + .bss + .noinit
 
 namespace {
 
@@ -76,7 +76,7 @@ float max_logic_err_mm; // worst |planner - current_position| seen
 
 uint8_t *stack_paint_start() {
     // Leave the stock stack guard word (STACK_GUARD_MARGIN, 4 bytes) alone.
-    return (uint8_t *)&__bss_end + STACK_GUARD_MARGIN + sizeof(uint32_t);
+    return (uint8_t *)&__heap_start + STACK_GUARD_MARGIN + sizeof(uint32_t);
 }
 
 uint16_t stack_free_bytes() {
@@ -188,7 +188,7 @@ void check_stack() {
     if (free_bytes < stack_min_free)
         stack_min_free = free_bytes;
     if (free_bytes < DIAG_STACK_MIN_FREE && !(flags & F_DUMPED_STACK)) {
-        printf_P(PSTR("DIAG: stack low, %u bytes left above .bss\n"), free_bytes);
+        printf_P(PSTR("DIAG: stack low, %u bytes left above static RAM\n"), free_bytes);
         take_dump(dump_crash_reason::diag_stack, F_DUMPED_STACK);
         alert();
     }

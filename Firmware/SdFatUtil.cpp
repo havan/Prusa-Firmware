@@ -34,13 +34,14 @@ int SdFatUtil::FreeRam() {
 }
 #else  // __arm__
 extern char *__brkval;
-extern char __bss_end;
+// End of all static RAM: .data, .bss and .noinit. The stack must stay above it.
+extern char __heap_start;
 /** Amount of free RAM
  * \return The number of free bytes.
  */
 int SdFatUtil::FreeRam() {
   char top;
-  return __brkval ? &top - __brkval : &top - &__bss_end;
+  return __brkval ? &top - __brkval : &top - &__heap_start;
 }
 #endif  // __arm
 
@@ -48,13 +49,13 @@ void SdFatUtil::set_stack_guard()
 {
 	uint32_t *stack_guard;
 
-	stack_guard = (uint32_t*)(&__bss_end + STACK_GUARD_MARGIN);
+	stack_guard = (uint32_t*)(&__heap_start + STACK_GUARD_MARGIN);
     *stack_guard = STACK_GUARD_TEST_VALUE;
 }
 
 bool SdFatUtil::test_stack_integrity()
 {
-	uint32_t* stack_guard = (uint32_t*)(&__bss_end + STACK_GUARD_MARGIN);
+	uint32_t* stack_guard = (uint32_t*)(&__heap_start + STACK_GUARD_MARGIN);
 	return (*stack_guard == STACK_GUARD_TEST_VALUE);
 }
 

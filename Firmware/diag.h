@@ -31,10 +31,21 @@ void diag_periodic();
 //! D90: print the diagnostics state (and, with DIAG_FAULT_INJECT, inject faults).
 void dcode_90();
 
+//! Record the command that is about to run. The last few are kept in RAM that
+//! survives a reset, so the next boot can show what ran just before it.
+void diag_command();
+
+//! Report how the previous session ended: a software restart (a jump to the
+//! reset vector, which leaves the peripherals configured) or a hardware reset,
+//! plus the last commands it ran. Call once, after the boot banner.
+void diag_boot_report();
+
 #else
 
 inline void diag_init() {}
 inline void diag_progress() {}
 inline void diag_periodic() {}
+inline void diag_command() {}
+inline void diag_boot_report() {}
 
 #endif // DIAG_BUILD

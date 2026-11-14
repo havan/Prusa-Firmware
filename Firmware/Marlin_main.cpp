@@ -1126,6 +1126,7 @@ void setup()
 #endif
 	SERIAL_ECHO_START;
 	puts_P(PSTR(" " FW_VERSION_FULL "_" FW_COMMIT_HASH));
+	diag_boot_report();
 
 	// by default the MMU shall remain disabled - PFW-1418
 	if (eeprom_init_default_byte((uint8_t *)EEPROM_MMU_ENABLED, 0)) {
@@ -3803,6 +3804,7 @@ There are reasons why some G Codes aren't in numerical order.
 void process_commands()
 {
 	if (!buflen) return; //empty command
+	diag_command(); // breadcrumb for the next boot, if this one ends in a reset
 
 #ifdef CMDBUFFER_DEBUG
   SERIAL_ECHOPGM("Processing a GCODE command: ");

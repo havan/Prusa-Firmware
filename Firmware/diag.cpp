@@ -19,6 +19,13 @@
 //!  3. A stack high-water mark, with a dump when the stack gets close to
 //!     .bss (diag_stack). The stock stack guard is a single word and can be
 //!     jumped over by a large frame.
+//!  4. Reset forensics: a printer that restarts without any dump left no
+//!     trace at all. A software restart (a wild jump or return to address 0)
+//!     leaves the peripherals configured; a real reset (power, brown-out,
+//!     reset pin, watchdog) puts them back to their defaults. The registers are
+//!     sampled before the C runtime starts, and the last commands are kept in
+//!     .noinit RAM, so the next boot can tell the two apart and show what ran
+//!     just before.
 //!
 //! All checks are rate limited and run from manage_heater(), which every wait
 //! loop calls; see diag.h.
@@ -29,6 +36,7 @@
 
 #include <avr/io.h>
 #include <avr/pgmspace.h>
+#include <string.h>
 #include "Marlin.h"
 #include "cardreader.h"
 #include "cmdqueue.h"
@@ -53,6 +61,51 @@ static constexpr uint16_t DIAG_REALERT_S = 60;           // beep period while st
 // Planner/stepper state that has no public declaration.
 extern float position_float[NUM_AXIS];
 extern char __heap_start; // end of .data + .bss + .noinit
+
+// Reset forensics state. It lives in .noinit, which the C runtime neither
+// loads nor clears, so it keeps its content across every reset that doesn't
+// cut the power.
+static constexpr uint16_t DIAG_CRUMB_MAGIC = 0xD1A9;
+static constexpr uint8_t DIAG_CRUMB_CMDS = 4;     // power of two
+static constexpr uint8_t DIAG_CRUMB_CMD_LEN = 27; // characters kept per command
+
+struct DiagCrumbs {
+    uint16_t magic;
+    uint8_t next;       // ring slot the next command goes to
+    uint8_t sessions;   // resets since the RAM was last found invalid
+    uint32_t uptime_ms; // _millis() at the last periodic check
+    struct {
+        uint32_t sdpos; // SD read position when the command started
+        uint8_t type;   // CMDBUFFER_CURRENT_TYPE_*
+        char text[DIAG_CRUMB_CMD_LEN + 1];
+    } cmd[DIAG_CRUMB_CMDS];
+};
+static DiagCrumbs crumbs __attribute__((section(".noinit")));
+
+// Peripheral registers as found at the reset vector, before the Arduino core
+// and setup() configure anything. Order: ADCSRA, TIMSK0..TIMSK5.
+static uint8_t boot_regs[7] __attribute__((section(".noinit")));
+
+// Runs in .init3: after __init has set up SP and r1 = 0, before .data and
+// .bss are initialised. A naked function placed in an .initN section has no
+// prologue, epilogue or ret; execution falls through to the next section.
+extern "C" void diag_sample_boot_regs() __attribute__((naked, used, section(".init3")));
+extern "C" void diag_sample_boot_regs() {
+    boot_regs[0] = ADCSRA;
+    boot_regs[1] = TIMSK0;
+    boot_regs[2] = TIMSK1;
+    boot_regs[3] = TIMSK2;
+    boot_regs[4] = TIMSK3;
+    boot_regs[5] = TIMSK4;
+    boot_regs[6] = TIMSK5;
+}
+
+// The firmware keeps the ADC running for the temperature readings from boot
+// on. Neither the hardware reset nor the bootloader enables it, so ADEN set at
+// the reset vector means the previous session jumped there in software.
+static bool warm_restart() {
+    return boot_regs[0] & _BV(ADEN);
+}
 
 namespace {
 
@@ -220,6 +273,7 @@ void diag_periodic() {
     if (now - last_period_ms < DIAG_PERIOD_MS)
         return;
     last_period_ms = now;
+    crumbs.uptime_ms = now;
     flags |= F_IN_PERIODIC;
 
     check_stall(now);
@@ -232,12 +286,53 @@ void diag_periodic() {
     flags &= ~F_IN_PERIODIC;
 }
 
+void diag_command() {
+    auto &c = crumbs.cmd[crumbs.next & (DIAG_CRUMB_CMDS - 1)];
+    c.sdpos = card.get_sdpos();
+    c.type = CMDBUFFER_CURRENT_TYPE;
+    strncpy(c.text, CMDBUFFER_CURRENT_STRING, DIAG_CRUMB_CMD_LEN);
+    c.text[DIAG_CRUMB_CMD_LEN] = 0;
+    crumbs.next = (crumbs.next + 1) & (DIAG_CRUMB_CMDS - 1);
+}
+
+void diag_boot_report() {
+    printf_P(PSTR("DIAG: reset %S (ADCSRA %02x TIMSK0-5 %02x %02x %02x %02x %02x %02x)\n"),
+             warm_restart() ? PSTR("WARM: software restart, a jump to address 0")
+                            : PSTR("cold: power-on, brown-out, reset pin or watchdog"),
+             boot_regs[0], boot_regs[1], boot_regs[2], boot_regs[3], boot_regs[4],
+             boot_regs[5], boot_regs[6]);
+    if (crumbs.magic == DIAG_CRUMB_MAGIC && crumbs.next < DIAG_CRUMB_CMDS) {
+        ++crumbs.sessions;
+        printf_P(PSTR("DIAG: previous session: up %lums, reset #%u since RAM was lost; "
+                      "last commands, oldest first:\n"),
+                 crumbs.uptime_ms, crumbs.sessions);
+        for (uint8_t i = 0; i < DIAG_CRUMB_CMDS; ++i) {
+            auto &c = crumbs.cmd[(crumbs.next + i) & (DIAG_CRUMB_CMDS - 1)];
+            // The text may be anything if RAM was corrupted: print it safely.
+            char text[DIAG_CRUMB_CMD_LEN + 1];
+            uint8_t n = 0;
+            for (; n < DIAG_CRUMB_CMD_LEN && c.text[n]; ++n)
+                text[n] = (c.text[n] >= ' ' && c.text[n] < 0x7f) ? c.text[n] : '?';
+            text[n] = 0;
+            printf_P(PSTR("DIAG:   type %u sdpos %lu: %s\n"), c.type, c.sdpos, text);
+        }
+    } else {
+        puts_P(PSTR("DIAG: previous session: no breadcrumbs (power was off)"));
+        crumbs.sessions = 0;
+    }
+    // Start a fresh record for this session.
+    const uint8_t sessions = crumbs.sessions;
+    memset(&crumbs, 0, sizeof(crumbs));
+    crumbs.sessions = sessions;
+    crumbs.magic = DIAG_CRUMB_MAGIC;
+}
+
 /*!
 ### D90 - Diagnostics status <a href="https://reprap.org/wiki/G-code#D90">D90</a>
 Print the state of the DIAG build checks.
 #### Usage
 
-    D90 [ T | S | Z ]
+    D90 [ T | S | Z | J ]
 
 #### Parameters
 - `T` - Set the stall timeout in seconds (0 restores the default). Not saved.
@@ -246,6 +341,9 @@ Print the state of the DIAG build checks.
         The stall detector is armed even without a print. Use with `T`.
 - `Z` - (fault injection) Add this many steps to the Z stepper counter. During a
         print the position check must then dump and stop the print.
+- `J` - (fault injection) Jump to address 0, like a corrupted return address
+        would. The next boot must report a WARM reset and list this D90 as the
+        last command.
 */
 void dcode_90() {
     if (code_seen('T')) {
@@ -259,6 +357,10 @@ void dcode_90() {
         count_position[Z_AXIS] += dz;
         CRITICAL_SECTION_END;
         printf_P(PSTR("DIAG: injected %ld Z steps\n"), dz);
+    }
+    if (code_seen('J')) {
+        puts_P(PSTR("DIAG: jumping to address 0"));
+        ((void (*)())0)();
     }
     if (code_seen('S')) {
         puts_P(PSTR("DIAG: stall trap, press the knob to leave"));
@@ -280,10 +382,12 @@ void dcode_90() {
                   "DIAG: stall armed %d, idle %lus, timeout %us\n"
                   "DIAG: stack min free %u bytes (now %u)\n"
                   "DIAG: max position error stepper %.4fmm logical %.4fmm\n"
-                  "DIAG: dumps taken this boot 0x%02x\n"),
+                  "DIAG: dumps taken this boot 0x%02x\n"
+                  "DIAG: last reset %S\n"),
              (int)stall_detector_armed(), (now - last_progress_ms) / 1000, stall_timeout_s,
              stack_min_free, stack_free_bytes(), (double)max_step_err_mm, (double)max_logic_err_mm,
-             flags & (F_DUMPED_STALL | F_DUMPED_POS | F_DUMPED_STACK));
+             flags & (F_DUMPED_STALL | F_DUMPED_POS | F_DUMPED_STACK),
+             warm_restart() ? PSTR("WARM (software)") : PSTR("cold"));
 }
 
 #endif // DIAG_BUILD

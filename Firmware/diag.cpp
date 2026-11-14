@@ -43,6 +43,7 @@
 #include "ConfigurationStore.h"
 #include "eeprom.h"
 #include "lcd.h"
+#include "mesh_bed_calibration.h"
 #include "planner.h"
 #include "sound.h"
 #include "stepper.h"
@@ -125,7 +126,7 @@ uint32_t last_period_ms;
 uint32_t last_alert_ms;
 uint16_t stack_min_free = UINT16_MAX;
 float max_step_err_mm;  // worst |stepper - planner| seen, for validating the tolerance
-float max_logic_err_mm; // worst |planner - current_position| seen
+float max_logic_err_mm; // worst |planner - world2machine(current_position)| seen
 
 uint8_t *stack_paint_start() {
     // Leave the stock stack guard word (STACK_GUARD_MARGIN, 4 bytes) alone.
@@ -211,11 +212,20 @@ void check_position() {
         || mesh_bed_leveling_flag || planner_aborted || blocks_queued())
         return;
 
+    // The planner keeps X/Y in machine coordinates: plan_buffer_line() and
+    // plan_set_position() apply the XYZ calibration (skew and bed offset) to
+    // them before storing position_float. current_position is in world
+    // coordinates, so transform it the same way before comparing. Z is stored
+    // untransformed (mesh leveling only affects the step target).
+    float expected[3] = {current_position[X_AXIS], current_position[Y_AXIS],
+                         current_position[Z_AXIS]};
+    world2machine(expected[X_AXIS], expected[Y_AXIS]);
+
     for (uint8_t axis = X_AXIS; axis <= Z_AXIS; ++axis) {
         const long steps = st_get_position(axis);
         const long planned = position[axis];
         const float step_err = (steps - planned) / cs.axis_steps_per_mm[axis];
-        const float logic_err = position_float[axis] - current_position[axis];
+        const float logic_err = position_float[axis] - expected[axis];
         const float abs_step_err = fabs(step_err);
         const float abs_logic_err = fabs(logic_err);
         if (abs_step_err > max_step_err_mm)

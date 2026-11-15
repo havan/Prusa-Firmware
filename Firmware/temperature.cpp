@@ -221,6 +221,147 @@ static float analog2tempAmbient(int raw);
 #endif
 static void updateTemperatures();
 
+// Sensors checked by td_check(), and the other records of the float probes.
+enum : uint8_t { TD_HOTEND, TD_BED, TD_PINDA, TD_AMBIENT, TD_SENSORS, TD_MODEL = TD_SENSORS, TD_BED_PID };
+
+#ifdef DIAG_BUILD
+static_assert(EXTRUDERS == 1, "the probes cover one hotend");
+
+// Non-finite float probes, reported by temp_diag_report() (see DIAG.md).
+//
+// The temperature conversions are table lookups and can't return inf or NaN,
+// yet an idle printer latched a TM error of |-inf| and a NaN bed PID D-term.
+// The probes catch the first non-finite value at each stage, with the inputs
+// that produced it. They record from the temperature ISR and print from the
+// main loop.
+
+struct TempDiagSensor {
+    uint32_t ms;     // first event
+    float bad;       // the non-finite result
+    float again;     // the same raw value converted again, interrupts off
+    int16_t raw;
+    uint8_t count;   // events, saturating
+};
+struct TempDiagModel {
+    uint32_t ms;
+    uint8_t heater_pwm, fan_pwm;
+    float heater_temp, ambient_temp, R, dP, dPl, dT, dT_f, dT_lag, T_prev, dT_err, dT_err_prev, dT_err_f;
+    uint8_t count;   // steps with a non-finite model input dT, saturating
+};
+struct TempDiagBedPid {
+    uint32_t ms;
+    float input, dState, dTerm_prev, dTerm;
+    uint8_t count;   // finite -> non-finite transitions, saturating
+};
+static TempDiagSensor td_sensor[TD_SENSORS];
+static TempDiagModel td_model;
+static TempDiagBedPid td_bed_pid;
+static uint8_t td_pending; // bit per record not reported yet
+
+static inline void td_count(uint8_t &count) {
+    if (count != UINT8_MAX)
+        ++count;
+}
+
+static float td_convert(uint8_t sensor, int raw) {
+    switch (sensor) {
+    case TD_HOTEND:
+        return analog2temp(raw, 0);
+#ifdef AMBIENT_THERMISTOR
+    case TD_AMBIENT:
+        return analog2tempAmbient(raw);
+#endif
+    default: // bed and PINDA share the bed table
+        return analog2tempBed(raw);
+    }
+}
+
+// Check a converted temperature. A non-finite one means the conversion itself
+// went wrong, so convert the same raw value again with interrupts off: a
+// different result says the first computation was disturbed. Use the second
+// result when it is finite, so one bad division doesn't latch the filters.
+static float td_check(uint8_t sensor, float t, int raw) {
+    if (isfinite(t))
+        return t;
+    float again;
+    CRITICAL_SECTION_START;
+    again = td_convert(sensor, raw);
+    CRITICAL_SECTION_END;
+    TempDiagSensor &s = td_sensor[sensor];
+    if (s.count == 0) {
+        s.ms = _millis();
+        s.bad = t;
+        s.again = again;
+        s.raw = raw;
+        td_pending |= 1 << sensor;
+    }
+    td_count(s.count);
+    return isfinite(again) ? again : t;
+}
+
+static uint32_t td_bits(float f) {
+    uint32_t u;
+    memcpy(&u, &f, sizeof(u));
+    return u;
+}
+
+static const char td_name_hotend[] PROGMEM = "hotend";
+static const char td_name_bed[] PROGMEM = "bed";
+static const char td_name_pinda[] PROGMEM = "PINDA";
+static const char td_name_ambient[] PROGMEM = "ambient";
+static const char *const td_names[TD_SENSORS] PROGMEM = {
+    td_name_hotend, td_name_bed, td_name_pinda, td_name_ambient,
+};
+
+void temp_diag_report() {
+    uint8_t pending;
+    CRITICAL_SECTION_START;
+    pending = td_pending;
+    td_pending = 0;
+    CRITICAL_SECTION_END;
+    if (!pending)
+        return;
+    // A record is written once, before its pending bit is set, and never
+    // again: it is safe to read here without blocking the ISR.
+    for (uint8_t i = 0; i < TD_SENSORS; ++i) {
+        if (!(pending & (1 << i)))
+            continue;
+        const TempDiagSensor &r = td_sensor[i];
+        printf_P(PSTR("DIAG: non-finite %S temperature at %lums: raw %d gave %f (%08lx), "
+                      "again with interrupts off %f (%08lx)\n"),
+                 (const char *)pgm_read_ptr(&td_names[i]), r.ms, r.raw,
+                 (double)r.bad, td_bits(r.bad), (double)r.again, td_bits(r.again));
+    }
+    if (pending & (1 << TD_MODEL)) {
+        const TempDiagModel &m = td_model;
+        printf_P(PSTR("DIAG: TM non-finite at %lums: pwm heater %u fan %u, T %f Ta %f R %f\n"
+                      "DIAG:   dP %f dPl %f dT %f (%08lx) dT_f %f dT_lag %f (%08lx)\n"
+                      "DIAG:   T_prev %f dT_err %f err_prev %f err_f %f (%08lx)\n"),
+                 m.ms, m.heater_pwm, m.fan_pwm, (double)m.heater_temp, (double)m.ambient_temp, (double)m.R,
+                 (double)m.dP, (double)m.dPl, (double)m.dT, td_bits(m.dT), (double)m.dT_f,
+                 (double)m.dT_lag, td_bits(m.dT_lag),
+                 (double)m.T_prev, (double)m.dT_err, (double)m.dT_err_prev, (double)m.dT_err_f,
+                 td_bits(m.dT_err_f));
+    }
+    if (pending & (1 << TD_BED_PID)) {
+        const TempDiagBedPid &b = td_bed_pid;
+        printf_P(PSTR("DIAG: bed PID D-term non-finite at %lums: input %f (%08lx) dState %f (%08lx) "
+                      "dTerm %f -> %f\n"),
+                 b.ms, (double)b.input, td_bits(b.input), (double)b.dState, td_bits(b.dState),
+                 (double)b.dTerm_prev, (double)b.dTerm);
+    }
+}
+
+void temp_diag_status() {
+    printf_P(PSTR("DIAG: non-finite temperatures: hotend %u bed %u PINDA %u ambient %u, "
+                  "TM inputs %u, bed D-term %u\n"),
+             td_sensor[TD_HOTEND].count, td_sensor[TD_BED].count, td_sensor[TD_PINDA].count,
+             td_sensor[TD_AMBIENT].count, td_model.count, td_bed_pid.count);
+}
+#else
+static inline float td_check(uint8_t, float t, int) { return t; }
+#endif // DIAG_BUILD
+
 enum TempRunawayStates : uint8_t
 {
 	TempRunaway_INACTIVE = 0,
@@ -1757,7 +1898,24 @@ static void pid_bed(const float current, const int target)
 
     //PID_K1 defined in Configuration.h in the PID settings
 #define K2 (1.0-PID_K1)
+#ifdef DIAG_BUILD
+    const float dTerm_prev = dTerm_bed;
+#endif
     dTerm_bed= (cs.bedKd * (pid_input - temp_dState_bed))*K2 + (PID_K1 * dTerm_bed);
+#ifdef DIAG_BUILD
+    // The IIR keeps a non-finite D-term forever: record how it got there.
+    if (!isfinite(dTerm_bed) && isfinite(dTerm_prev)) {
+        if (td_bed_pid.count == 0) {
+            td_bed_pid.ms = _millis();
+            td_bed_pid.input = pid_input;
+            td_bed_pid.dState = temp_dState_bed;
+            td_bed_pid.dTerm_prev = dTerm_prev;
+            td_bed_pid.dTerm = dTerm_bed;
+            td_pending |= 1 << TD_BED_PID;
+        }
+        td_count(td_bed_pid.count);
+    }
+#endif
     temp_dState_bed = pid_input;
 
     pid_output = pTerm_bed + iTerm_bed - dTerm_bed;
@@ -1904,14 +2062,22 @@ static void updateTemperatures()
    analog2temp is relatively slow */
 static void setIsrTemperaturesFromRawValues()
 {
-    for(uint8_t e=0;e<EXTRUDERS;e++)
-        current_temperature_isr[e] = analog2temp(current_temperature_raw[e], e);
-    current_temperature_bed_isr = analog2tempBed(current_temperature_bed_raw);
+    // The ADC interrupt can update the raw values meanwhile: convert a copy,
+    // so a recheck by td_check() sees the same input.
+    int raw;
+    for(uint8_t e=0;e<EXTRUDERS;e++) {
+        raw = current_temperature_raw[e];
+        current_temperature_isr[e] = td_check(TD_HOTEND + e, analog2temp(raw, e), raw);
+    }
+    raw = current_temperature_bed_raw;
+    current_temperature_bed_isr = td_check(TD_BED, analog2tempBed(raw), raw);
 #ifdef PINDA_THERMISTOR
-    current_temperature_pinda_isr = analog2tempBed(current_temperature_raw_pinda);
+    raw = current_temperature_raw_pinda;
+    current_temperature_pinda_isr = td_check(TD_PINDA, analog2tempBed(raw), raw);
 #endif
 #ifdef AMBIENT_THERMISTOR
-    current_temperature_ambient_isr = analog2tempAmbient(current_temperature_raw_ambient); //thermistor for ambient is NTCG104LH104JT1 (2000)
+    raw = current_temperature_raw_ambient;
+    current_temperature_ambient_isr = td_check(TD_AMBIENT, analog2tempAmbient(raw), raw); //thermistor for ambient is NTCG104LH104JT1 (2000)
 #endif
     temp_meas_ready = true;
 }
@@ -2117,6 +2283,33 @@ void model_data::step(uint8_t heater_pwm, uint8_t fan_pwm, float heater_temp, fl
     // calculate and filter dT_err
     float dT_err = (cur_heater_temp - T_prev) - dT_lag;
     float dT_err_f = iir_mul(dT_err_prev, dT_err, THERMAL_MODEL_fE, 0.);
+#ifdef DIAG_BUILD
+    // dT_err is NaN while the lag buffer fills after a reset, which iir_mul
+    // turns into 0 on the next step, so only an inf error counts. Once one
+    // non-finite value enters the lag buffer it stays forever: record the first.
+    if (!isfinite(dT) || !isfinite(dT_f) || isinf(dT_err_f)) {
+        if (td_model.ms == 0) {
+            td_model.ms = _millis() | 1;
+            td_model.heater_pwm = heater_pwm;
+            td_model.fan_pwm = fan_pwm;
+            td_model.heater_temp = heater_temp;
+            td_model.ambient_temp = ambient_temp;
+            td_model.R = cur_R;
+            td_model.dP = dP;
+            td_model.dPl = dPl;
+            td_model.dT = dT;
+            td_model.dT_f = dT_f;
+            td_model.dT_lag = dT_lag;
+            td_model.T_prev = T_prev;
+            td_model.dT_err = dT_err;
+            td_model.dT_err_prev = dT_err_prev;
+            td_model.dT_err_f = dT_err_f;
+            td_pending |= 1 << TD_MODEL;
+        }
+        if (!isfinite(dT))
+            td_count(td_model.count);
+    }
+#endif
     T_prev = cur_heater_temp;
     dT_err_prev = dT_err_f;
 

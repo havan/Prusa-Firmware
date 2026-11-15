@@ -173,22 +173,22 @@ struct DiagRamTest {
 static DiagRamTest ram_test __attribute__((section(".noinit")));
 extern "C" char __noinit_start, __noinit_end;
 
-static inline __attribute__((always_inline)) void ram_check(volatile uint8_t *p, uint8_t expected) {
+static inline __attribute__((always_inline)) void ram_check(DiagRamTest &rec, volatile uint8_t *p, uint8_t expected) {
     const uint8_t got = *p;
     if (got != expected) {
-        if (ram_test.errors == 0) {
-            ram_test.addr = (uint16_t)p;
-            ram_test.expected = expected;
-            ram_test.got = got;
+        if (rec.errors == 0) {
+            rec.addr = (uint16_t)p;
+            rec.expected = expected;
+            rec.got = got;
         }
-        if (ram_test.errors != UINT16_MAX)
-            ++ram_test.errors;
+        if (rec.errors != UINT16_MAX)
+            ++rec.errors;
     }
 }
 
 // March C- over [lo, hi) with background pattern bg and its inverse. Finds
 // stuck, transition and most coupling faults, not transient flips.
-static inline __attribute__((always_inline)) void ram_march(volatile uint8_t *lo, volatile uint8_t *hi, uint8_t bg) {
+static inline __attribute__((always_inline)) void ram_march(DiagRamTest &rec, volatile uint8_t *lo, volatile uint8_t *hi, uint8_t bg) {
     const uint8_t inv = ~bg;
     volatile uint8_t *p;
     wdt_reset();
@@ -196,27 +196,27 @@ static inline __attribute__((always_inline)) void ram_march(volatile uint8_t *lo
         *p = bg;
     wdt_reset();
     for (p = lo; p < hi; ++p) { // up: r0 w1
-        ram_check(p, bg);
+        ram_check(rec, p, bg);
         *p = inv;
     }
     wdt_reset();
     for (p = lo; p < hi; ++p) { // up: r1 w0
-        ram_check(p, inv);
+        ram_check(rec, p, inv);
         *p = bg;
     }
     wdt_reset();
     for (p = hi; p-- != lo;) { // down: r0 w1
-        ram_check(p, bg);
+        ram_check(rec, p, bg);
         *p = inv;
     }
     wdt_reset();
     for (p = hi; p-- != lo;) { // down: r1 w0
-        ram_check(p, inv);
+        ram_check(rec, p, inv);
         *p = bg;
     }
     wdt_reset();
     for (p = lo; p < hi; ++p) // r0
-        ram_check(p, bg);
+        ram_check(rec, p, bg);
 }
 
 // Runs in .init3 like diag_sample_boot_regs(): SP is at RAMEND with nothing
@@ -230,7 +230,7 @@ extern "C" void diag_ram_test() {
     for (uint8_t pass = 0; pass < 4; ++pass) {
         volatile uint8_t *lo = (pass & 1) ? (volatile uint8_t *)&__noinit_end : (volatile uint8_t *)RAMSTART;
         volatile uint8_t *hi = (pass & 1) ? (volatile uint8_t *)(RAMEND + 1) : (volatile uint8_t *)&__noinit_start;
-        ram_march(lo, hi, (pass & 2) ? 0x55 : 0x00);
+        ram_march(ram_test, lo, hi, (pass & 2) ? 0x55 : 0x00);
     }
 }
 
@@ -401,6 +401,54 @@ void check_stack() {
     }
 }
 
+// Idle RAM test: march the free stack area in small chunks while the printer
+// does nothing. Nested interrupts push their frames there, so a weak cell in
+// it corrupts whatever they interrupted, without leaving a trace in the RAM
+// that holds variables. Each chunk is saved, tested and restored with
+// interrupts off (about 50 us, short enough for the serial receiver), so the
+// stack paint used by check_stack() survives.
+constexpr uint8_t IDLE_RAM_CHUNK = 8;
+constexpr uint8_t IDLE_RAM_CHUNKS_PER_PERIOD = 16;
+DiagRamTest idle_ram;     // failures this boot
+uint16_t idle_ram_sweeps; // complete passes over the area
+uint16_t idle_ram_offset; // next chunk, from stack_paint_start()
+bool idle_ram_reported;
+
+void check_idle_ram() {
+    if (printJobOngoing() || blocks_queued() || homing_flag || mesh_bed_leveling_flag)
+        return;
+    uint8_t saved[IDLE_RAM_CHUNK];
+    for (uint8_t n = 0; n < IDLE_RAM_CHUNKS_PER_PERIOD; ++n) {
+        bool wrapped;
+        CRITICAL_SECTION_START;
+        // Stay 64 bytes below SP: our frame and saved[] are above it, and
+        // nothing else can push while interrupts are off.
+        volatile uint8_t *const p = stack_paint_start() + idle_ram_offset;
+        wrapped = p + IDLE_RAM_CHUNK > (volatile uint8_t *)SP - 64;
+        if (!wrapped) {
+            for (uint8_t i = 0; i < IDLE_RAM_CHUNK; ++i)
+                saved[i] = p[i];
+            ram_march(idle_ram, p, p + IDLE_RAM_CHUNK, 0x00);
+            ram_march(idle_ram, p, p + IDLE_RAM_CHUNK, 0x55);
+            for (uint8_t i = 0; i < IDLE_RAM_CHUNK; ++i)
+                p[i] = saved[i];
+            idle_ram_offset += IDLE_RAM_CHUNK;
+        } else {
+            idle_ram_offset = 0;
+            ++idle_ram_sweeps;
+        }
+        CRITICAL_SECTION_END;
+        if (wrapped)
+            break;
+    }
+    if (idle_ram.errors && !idle_ram_reported) {
+        idle_ram_reported = true;
+        printf_P(PSTR("DIAG: IDLE RAM TEST FAILED at %04x: wrote %02x read %02x\n"),
+                 idle_ram.addr, idle_ram.expected, idle_ram.got);
+        alert();
+    }
+}
+
 void motion_stall_end(uint32_t now) {
     if (!motion_reported)
         return;
@@ -509,6 +557,8 @@ void diag_periodic() {
 
     check_stall(now);
     check_motion(now);
+    temp_diag_report();
+    check_idle_ram();
     check_position();
     if (++period_count >= DIAG_STACK_PERIOD) {
         period_count = 0;
@@ -684,6 +734,11 @@ void dcode_90() {
                   "DIAG: boot RAM test %S\n"),
              motion_stalls, motion_stall_max_ms, (double)raw_to_volts(vmin), (double)raw_to_volts(vmax),
              ram_test.errors ? PSTR("FAILED") : PSTR("passed"));
+    temp_diag_status();
+    printf_P(PSTR("DIAG: idle RAM test %u sweeps, %u failures"), idle_ram_sweeps, idle_ram.errors);
+    if (idle_ram.errors)
+        printf_P(PSTR(", first at %04x: wrote %02x read %02x"), idle_ram.addr, idle_ram.expected, idle_ram.got);
+    putchar('\n');
     printf_P(PSTR("DIAG: build " FW_VERSION_FULL "_" FW_COMMIT_HASH "\n"
                   "DIAG: stall armed %d, idle %lus, timeout %us\n"
                   "DIAG: stack min free %u bytes (now %u)\n"

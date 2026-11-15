@@ -195,6 +195,13 @@ void thermal_model_log_enable(bool enable);
 #endif
 #endif
 
+#ifdef DIAG_BUILD
+//! Print the float probe records not reported yet (main loop only).
+void temp_diag_report();
+//! Print the float probe event counts (D90).
+void temp_diag_status();
+#endif
+
 #ifdef FAN_SOFT_PWM
 extern unsigned char fanSpeedSoftPwm;
 #endif

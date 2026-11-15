@@ -48,6 +48,8 @@
 #include <string.h>
 #include <util/crc16.h>
 #include "Marlin.h"
+#include "bootapp.h"
+#include "config.h"
 #include "cardreader.h"
 #include "cmdqueue.h"
 #include "ConfigurationStore.h"
@@ -220,18 +222,41 @@ static inline __attribute__((always_inline)) void ram_march(DiagRamTest &rec, vo
 }
 
 // Runs in .init3 like diag_sample_boot_regs(): SP is at RAMEND with nothing
-// pushed, and .data/.bss are not set up yet, so every byte outside .noinit is
-// free to overwrite. Must not call anything (a call would push onto the RAM
-// under test) and must not spill to the stack; check the disassembly after
-// changing it. Takes about 60 ms.
+// pushed, and .data/.bss are not set up yet, so almost every byte outside
+// .noinit is free to overwrite. Must not call anything (a call would push onto
+// the RAM under test) and must not spill to the stack; check the disassembly
+// after changing it. Takes about 60 ms.
+//
+// Two things in RAM must survive a reset that keeps RAM (a software restart,
+// the watchdog, the bootloader's own restarts):
+//  - the bootloader handshake (bootapp.h, the 16 bytes below RAMSIZE): a
+//    language update spans several restarts and keeps its state there, so
+//    these bytes are not tested;
+//  - the stack guard word: setup() writes it, but after a software restart the
+//    timer interrupts are still enabled and soft_pwm_isr() checks the guard
+//    before setup() gets there. The stock firmware relied on the old value
+//    surviving in RAM; write it again after the test.
+static constexpr uint16_t BOOTAPP_VARS_LO = RAMSIZE - 16;
+static constexpr uint16_t BOOTAPP_VARS_HI = RAMSIZE;
 extern "C" void diag_ram_test() __attribute__((naked, used, section(".init3")));
 extern "C" void diag_ram_test() {
     ram_test.errors = 0;
-    for (uint8_t pass = 0; pass < 4; ++pass) {
-        volatile uint8_t *lo = (pass & 1) ? (volatile uint8_t *)&__noinit_end : (volatile uint8_t *)RAMSTART;
-        volatile uint8_t *hi = (pass & 1) ? (volatile uint8_t *)(RAMEND + 1) : (volatile uint8_t *)&__noinit_start;
-        ram_march(ram_test, lo, hi, (pass & 2) ? 0x55 : 0x00);
+    for (uint8_t pass = 0; pass < 6; ++pass) {
+        const uint8_t range = pass < 3 ? pass : pass - 3;
+        volatile uint8_t *lo, *hi;
+        if (range == 0) {
+            lo = (volatile uint8_t *)RAMSTART;
+            hi = (volatile uint8_t *)&__noinit_start;
+        } else if (range == 1) {
+            lo = (volatile uint8_t *)&__noinit_end;
+            hi = (volatile uint8_t *)BOOTAPP_VARS_LO;
+        } else {
+            lo = (volatile uint8_t *)BOOTAPP_VARS_HI;
+            hi = (volatile uint8_t *)(RAMEND + 1);
+        }
+        ram_march(ram_test, lo, hi, pass < 3 ? 0x00 : 0x55);
     }
+    *(volatile uint32_t *)((uint8_t *)&__heap_start + STACK_GUARD_MARGIN) = STACK_GUARD_TEST_VALUE;
 }
 
 // The firmware keeps the ADC running for the temperature readings from boot
@@ -527,6 +552,9 @@ float raw_to_volts(uint16_t raw) {
 
 uint16_t diag_vpwr_min = UINT16_MAX;
 uint16_t diag_vpwr_max;
+uint16_t diag_vbg_min = UINT16_MAX;
+uint16_t diag_vbg_max;
+uint16_t diag_vbg_last;
 
 void diag_init() {
     // Interrupts must be off: an ISR firing now would push its frame below SP,
@@ -608,8 +636,8 @@ void diag_boot_report() {
         }
     }
     if (ram_test.errors == 0) {
-        printf_P(PSTR("DIAG: RAM test passed (march C-, %u bytes outside .noinit)\n"),
-                 (unsigned)(RAMEND + 1 - RAMSTART - (&__noinit_end - &__noinit_start)));
+        printf_P(PSTR("DIAG: RAM test passed (march C-, %u bytes outside .noinit and the bootloader vars)\n"),
+                 (unsigned)(RAMEND + 1 - RAMSTART - (&__noinit_end - &__noinit_start) - 16));
     } else {
         printf_P(PSTR("DIAG: RAM TEST FAILED: %u bad reads, first at %04x: expected %02x, read %02x\n"),
                  ram_test.errors, ram_test.addr, ram_test.expected, ram_test.got);
@@ -675,10 +703,76 @@ Print the state of the DIAG build checks.
         Queue a long move first: the motion stall report must fire, name
         TIMSK1 without OCIE1A (bit 1) and 0 isr/s, then report the resume.
 */
+extern "C" char __data_load_end; // end of the program image in flash
+
+namespace {
+
+constexpr uint16_t FLASH_BLOCK = 4096;
+
+uint16_t flash_block_crc(uint32_t start, uint32_t end, bool irq_off) {
+    uint16_t crc = 0xFFFF;
+    const uint8_t sreg = SREG;
+    if (irq_off)
+        cli();
+    for (uint32_t a = start; a < end; ++a)
+        crc = _crc_ccitt_update(crc, pgm_read_byte_far(a));
+    SREG = sreg;
+    return crc;
+}
+
+// D90 C<n>: CRC of each 4 KB block of the program image, n rounds. Round 1
+// runs with interrupts off and prints every block; later rounds alternate
+// interrupts on/off and print only the blocks that differ from round 1.
+// Compare round 1 with flash_crc.py --blocks on the PC.
+void flash_check(uint8_t rounds) {
+    const uint32_t end = pgm_get_far_address(__data_load_end);
+    constexpr uint8_t MAX_BLOCKS = 64;
+    const uint8_t blocks = (end + FLASH_BLOCK - 1) / FLASH_BLOCK;
+    if (blocks > MAX_BLOCKS)
+        return;
+    uint16_t first[MAX_BLOCKS];
+    for (uint8_t r = 0; r < rounds; ++r) {
+        const bool irq_off = !(r & 1);
+        printf_P(PSTR("DIAG: flash round %u, interrupts %S, bandgap %u:"), r + 1,
+                 irq_off ? PSTR("off") : PSTR("on"), diag_vbg_last);
+        uint8_t diff = 0;
+        for (uint8_t b = 0; b < blocks; ++b) {
+            wdt_reset();
+            const uint32_t s = (uint32_t)b * FLASH_BLOCK;
+            const uint16_t crc = flash_block_crc(s, (s + FLASH_BLOCK < end) ? s + FLASH_BLOCK : end, irq_off);
+            if (r == 0) {
+                first[b] = crc;
+                if ((b & 7) == 0)
+                    printf_P(PSTR("\nDIAG:   %02u:"), b);
+                printf_P(PSTR(" %04x"), crc);
+            } else if (crc != first[b]) {
+                ++diff;
+                printf_P(PSTR(" %u:%04x"), b, crc);
+            }
+        }
+        if (r == 0)
+            putchar('\n');
+        else
+            printf_P(PSTR(" -> %u of %u blocks differ from round 1\n"), diff, blocks);
+        delay_keep_alive(0);
+    }
+}
+
+} // anonymous namespace
+
 void dcode_90() {
     if (code_seen('T')) {
         const uint16_t t = code_value_short();
         stall_timeout_s = t ? t : DIAG_STALL_TIMEOUT_S;
+    }
+    if (code_seen('C')) {
+        // Interrupts go off for ~7 ms per block: not while anything moves.
+        if (blocks_queued() || printJobOngoing()) {
+            puts_P(PSTR("DIAG: flash check refused while printing or moving"));
+        } else {
+            uint16_t rounds = code_value_short();
+            flash_check(rounds < 1 ? 1 : (rounds > 20 ? 20 : rounds));
+        }
     }
 #ifdef DIAG_FAULT_INJECT
     if (code_seen('Z')) {
@@ -724,11 +818,18 @@ void dcode_90() {
     }
 #endif // DIAG_FAULT_INJECT
     const uint32_t now = _millis();
-    uint16_t vmin, vmax;
+    uint16_t vmin, vmax, bmin, bmax, bnow;
     CRITICAL_SECTION_START;
     vmin = diag_vpwr_min;
     vmax = diag_vpwr_max;
+    bmin = diag_vbg_min;
+    bmax = diag_vbg_max;
+    bnow = diag_vbg_last;
     CRITICAL_SECTION_END;
+    // 5 V = 1.1 V * 1024 * 16 / reading (nominal bandgap, +-10 %): a high
+    // reading is a low supply.
+    printf_P(PSTR("DIAG: 5V bandgap reading since boot min %u max %u now %u (5V = 18022/reading)\n"),
+             bmin, bmax, bnow);
     printf_P(PSTR("DIAG: motion stalls %u, longest ~%lums\n"
                   "DIAG: 24V supply since boot min %.2fV max %.2fV\n"
                   "DIAG: boot RAM test %S\n"),

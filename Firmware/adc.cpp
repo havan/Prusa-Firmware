@@ -5,6 +5,7 @@
 #include <avr/pgmspace.h>
 #include <string.h>
 #include "pins.h"
+#include "diag.h"
 
 static uint8_t adc_count; //used for oversampling
 static uint8_t adc_channel_idx; //bitmask index
@@ -55,17 +56,65 @@ void adc_start_cycle() {
 extern void ADC_CALLBACK();
 #endif //ADC_CALLBACK
 
+#ifdef DIAG_BUILD
+// After the regular channels, measure the 1.1 V bandgap against AVCC: the
+// reading gives the MCU's own 5 V supply (diag.h). The first conversions after
+// switching are dropped while the bandgap and the sample capacitor settle.
+// This runs before the callback, so the next cycle can't start meanwhile.
+static constexpr uint8_t VBG_MUX = 0x1E; // MUX5:0 = 0b011110
+static constexpr uint8_t VBG_SKIP = 4;
+static uint16_t vbg_sum;
+
+static bool adc_bandgap_step()
+{
+    if (adc_count >= VBG_SKIP)
+        vbg_sum += ADC;
+    if (++adc_count < VBG_SKIP + ADC_OVRSAMPL)
+        return false;
+    // adc_setmux() only sets MUX2:0, so clear MUX4:3 for the next cycle.
+    ADMUX &= ~0x1F;
+    diag_bandgap_sample(vbg_sum);
+    return true;
+}
+
+static void adc_bandgap_start()
+{
+    adc_count = 0;
+    vbg_sum = 0;
+    ADCSRB &= ~(1 << MUX5);
+    ADMUX = (ADMUX & ~0x1F) | VBG_MUX;
+}
+#endif //DIAG_BUILD
+
 ISR(ADC_vect)
 {
+#ifdef DIAG_BUILD
+    if (adc_channel == ADC_CHAN_CNT) {
+        if (!adc_bandgap_step()) {
+            ADCSRA |= (1 << ADSC);
+            return;
+        }
+#ifdef ADC_CALLBACK
+        ADC_CALLBACK();
+#endif
+        return;
+    }
+#endif //DIAG_BUILD
     adc_values[adc_channel] += ADC;
     if (++adc_count == ADC_OVRSAMPL)
     {
         // go to the next channel
         if (++adc_channel == ADC_CHAN_CNT) {
+#ifdef DIAG_BUILD
+            adc_bandgap_start();
+            ADCSRA |= (1 << ADSC);
+            return;
+#else
 #ifdef ADC_CALLBACK
             ADC_CALLBACK();
 #endif
             return; // do not start the next measurement since there are no channels remaining
+#endif //DIAG_BUILD
         }
 
         // find the next channel

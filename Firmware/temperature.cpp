@@ -299,19 +299,15 @@ static float td_check(uint8_t sensor, float t, int raw) {
     return isfinite(again) ? again : t;
 }
 
-static uint32_t td_bits(float f) {
-    uint32_t u;
-    memcpy(&u, &f, sizeof(u));
-    return u;
+// The records are printed as raw little-endian bytes to keep the code small;
+// decode them on the PC with temp_diag_decode.py (sensor index, then fields in
+// declaration order).
+static void td_dump(const char *what, uint8_t index, const void *rec, uint8_t len) {
+    printf_P(PSTR("DIAG: non-finite %S %u:"), what, index);
+    for (const uint8_t *p = (const uint8_t *)rec; len--; ++p)
+        printf_P(PSTR(" %02x"), *p);
+    putchar('\n');
 }
-
-static const char td_name_hotend[] PROGMEM = "hotend";
-static const char td_name_bed[] PROGMEM = "bed";
-static const char td_name_pinda[] PROGMEM = "PINDA";
-static const char td_name_ambient[] PROGMEM = "ambient";
-static const char *const td_names[TD_SENSORS] PROGMEM = {
-    td_name_hotend, td_name_bed, td_name_pinda, td_name_ambient,
-};
 
 void temp_diag_report() {
     uint8_t pending;
@@ -319,37 +315,15 @@ void temp_diag_report() {
     pending = td_pending;
     td_pending = 0;
     CRITICAL_SECTION_END;
-    if (!pending)
-        return;
     // A record is written once, before its pending bit is set, and never
     // again: it is safe to read here without blocking the ISR.
-    for (uint8_t i = 0; i < TD_SENSORS; ++i) {
-        if (!(pending & (1 << i)))
-            continue;
-        const TempDiagSensor &r = td_sensor[i];
-        printf_P(PSTR("DIAG: non-finite %S temperature at %lums: raw %d gave %f (%08lx), "
-                      "again with interrupts off %f (%08lx)\n"),
-                 (const char *)pgm_read_ptr(&td_names[i]), r.ms, r.raw,
-                 (double)r.bad, td_bits(r.bad), (double)r.again, td_bits(r.again));
-    }
-    if (pending & (1 << TD_MODEL)) {
-        const TempDiagModel &m = td_model;
-        printf_P(PSTR("DIAG: TM non-finite at %lums: pwm heater %u fan %u, T %f Ta %f R %f\n"
-                      "DIAG:   dP %f dPl %f dT %f (%08lx) dT_f %f dT_lag %f (%08lx)\n"
-                      "DIAG:   T_prev %f dT_err %f err_prev %f err_f %f (%08lx)\n"),
-                 m.ms, m.heater_pwm, m.fan_pwm, (double)m.heater_temp, (double)m.ambient_temp, (double)m.R,
-                 (double)m.dP, (double)m.dPl, (double)m.dT, td_bits(m.dT), (double)m.dT_f,
-                 (double)m.dT_lag, td_bits(m.dT_lag),
-                 (double)m.T_prev, (double)m.dT_err, (double)m.dT_err_prev, (double)m.dT_err_f,
-                 td_bits(m.dT_err_f));
-    }
-    if (pending & (1 << TD_BED_PID)) {
-        const TempDiagBedPid &b = td_bed_pid;
-        printf_P(PSTR("DIAG: bed PID D-term non-finite at %lums: input %f (%08lx) dState %f (%08lx) "
-                      "dTerm %f -> %f\n"),
-                 b.ms, (double)b.input, td_bits(b.input), (double)b.dState, td_bits(b.dState),
-                 (double)b.dTerm_prev, (double)b.dTerm);
-    }
+    for (uint8_t i = 0; i < TD_SENSORS; ++i)
+        if (pending & (1 << i))
+            td_dump(PSTR("temp"), i, &td_sensor[i], sizeof(td_sensor[i]));
+    if (pending & (1 << TD_MODEL))
+        td_dump(PSTR("TM"), TD_MODEL, &td_model, sizeof(td_model));
+    if (pending & (1 << TD_BED_PID))
+        td_dump(PSTR("bedPID"), TD_BED_PID, &td_bed_pid, sizeof(td_bed_pid));
 }
 
 void temp_diag_status() {

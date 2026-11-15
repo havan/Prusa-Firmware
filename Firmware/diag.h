@@ -51,6 +51,19 @@ inline void diag_voltage_sample(uint16_t raw) {
         diag_vpwr_max = raw;
 }
 
+//! Raw 1.1 V bandgap readings (sum of ADC_OVRSAMPL samples against AVCC) since
+//! boot: the MCU's 5 V supply is 1.1 V * 1024 * ADC_OVRSAMPL / reading. A high
+//! reading means a low supply. Updated after every ADC cycle (adc.cpp).
+extern uint16_t diag_vbg_min, diag_vbg_max, diag_vbg_last;
+
+inline void diag_bandgap_sample(uint16_t raw) {
+    diag_vbg_last = raw;
+    if (raw < diag_vbg_min)
+        diag_vbg_min = raw;
+    if (raw > diag_vbg_max)
+        diag_vbg_max = raw;
+}
+
 #else
 
 inline void diag_init() {}
@@ -59,5 +72,6 @@ inline void diag_periodic() {}
 inline void diag_command() {}
 inline void diag_boot_report() {}
 inline void diag_voltage_sample(uint16_t) {}
+inline void diag_bandgap_sample(uint16_t) {}
 
 #endif // DIAG_BUILD
